@@ -6,9 +6,30 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import akshare as ak
 import numpy as np
 import pandas as pd
+
+# ================= 全局网络重试会话配置 =================
+def create_retry_session(retries=3, backoff_factor=1.0, status_forcelist=(429, 500, 502, 503, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+GLOBAL_SESSION = create_retry_session()
+# =========================================================
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime.now(TZ)
@@ -25,9 +46,9 @@ def calculate_indicators(df):
     high_col = "最高" if "最高" in df.columns else "high"
     low_col = "最低" if "最低" in df.columns else "low"
     
-    # 强制转换数值
     for c in [close_col, vol_col, high_col, low_col]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     
     df = df.dropna(subset=[close_col]).reset_index(drop=True)
 
@@ -48,7 +69,6 @@ def calculate_indicators(df):
     df["MACD"] = 2 * (df["DIF"] - df["DEA"])
     df["成交量均值5"] = df[vol_col].rolling(5).mean()
     
-    # 计算 ATR (用于动态止盈止损)
     tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
     df["ATR"] = tr.rolling(14).mean()
     
@@ -62,11 +82,19 @@ def process_single_stock(row, today_compact):
     try:
         hist = None
         try:
-            hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"), end_date=today_compact, adjust="qfq")
+            hist = ak.stock_zh_a_hist(
+                symbol=code, 
+                period="daily", 
+                start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"), 
+                end_date=today_compact, 
+                adjust="qfq"
+            )
         except Exception:
             if code.startswith('6'): symbol_sina = f"sh{code}"
             elif code.startswith('0') or code.startswith('3'): symbol_sina = f"sz{code}"
             else: return None, f"{code} 不支持"
+            
+            # 新浪日线接口切换兜底
             hist = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
             hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量', 'high': '最高', 'low': '最低'})
 
@@ -96,9 +124,8 @@ def process_single_stock(row, today_compact):
         vol5 = float(last["成交量均值5"])
         atr = float(last["ATR"])
         
-        if not np.isfinite(atr) or atr <= 0: atr = price * 0.03 # 兜底波动率
+        if not np.isfinite(atr) or atr <= 0: atr = price * 0.03
 
-        # ================= 评分逻辑 =================
         score = 0.0
         reasons = []
         if price >= ma5: score += 1; reasons.append("站上MA5")
@@ -111,17 +138,9 @@ def process_single_stock(row, today_compact):
         if 1 <= turnover <= 10: score += 0.5; reasons.append("换手活跃")
         if pct > 5: score -= 2; reasons.append("追高风险")
 
-        # ================= 智能交易计划（止盈止损） =================
-        # 目标1：基于 1.5 倍 ATR 的预期涨幅（最稳的日内波动利润）
         target_price_1 = price + (atr * 1.5)
-        
-        # 目标2：近期高点压制或 MA20 压制
-        recent_high = float(hist['最高'].iloc[-10:].max()) if '最高' in hist.columns else price * 1.05
-        target_price_2 = max(target_price_1, recent_high)
-        
-        # 止损：跌破 MA5，或者固定 2 倍 ATR
         stop_loss = min(ma5, price - (atr * 1.5))
-        if stop_loss >= price: stop_loss = price * 0.97 # 防止止损价高于现价
+        if stop_loss >= price: stop_loss = price * 0.97
 
         exp_profit_pct = ((target_price_1 - price) / price) * 100
         risk_pct = ((price - stop_loss) / price) * 100
@@ -138,11 +157,10 @@ def process_single_stock(row, today_compact):
         }
         return candidate, None
 
-    except Exception as exc:
+    except Exception:
         return None, f"{code} 异常"
 
 def scan_market():
-    # 交易日校验与行情获取
     try:
         trade_dates = ak.tool_trade_date_hist_sina()
         trade_dates["trade_date"] = pd.to_datetime(trade_dates["trade_date"]).dt.strftime("%Y-%m-%d")
@@ -154,10 +172,19 @@ def scan_market():
 
     spot = None
     try:
+        log("正在获取沪深全市场实时行情...")
         spot = ak.stock_zh_a_spot_em()
-    except Exception:
-        spot = ak.stock_zh_a_spot().rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
-        if '换手率' not in spot.columns: spot['换手率'] = 1.0 
+    except Exception as e:
+        log(f"东财实时接口异常({e})，尝试新浪快照兜底...")
+        # 备用链路增加短暂休眠以缓解频控
+        time.sleep(2) 
+        try:
+            spot = ak.stock_zh_a_spot().rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
+            if '换手率' not in spot.columns: spot['换手率'] = 1.0
+        except Exception as e2:
+            log(f"新浪快照接口同样超时: {e2}，执行最后一次等待重试...")
+            time.sleep(5)
+            spot = ak.stock_zh_a_spot_em()
 
     for col in ["最新价", "涨跌幅", "成交额", "换手率"]:
         spot[col] = pd.to_numeric(spot[col], errors="coerce")
@@ -176,9 +203,13 @@ def scan_market():
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(process_single_stock, row, TODAY_COMPACT): row for _, row in spot.iterrows()}
+        completed_count = 0
         for future in as_completed(futures):
+            completed_count += 1
             c, _ = future.result()
             if c: candidates.append(c)
+            if completed_count % 100 == 0:
+                log(f"进度：已扫描 {completed_count}/{len(spot)}，入选 {len(candidates)} 只")
 
     if not candidates:
         raise RuntimeError("没有取得有效候选数据。")
@@ -199,12 +230,10 @@ def scan_market():
         for i, item in enumerate(result.to_dict("records"), start=1):
             report.append(f"### {i}. {item['名称']}（{item['代码']}） | 评分: {item['评分']}")
             report.append(f"- **收盘价**：{item['收盘价']} (当日涨幅 {item['当日涨跌幅%']}%)")
-            report.append(f"- 🎯 **第一止盈位**：**{item['止盈位']}** (预期盈 **+{item['预期盈%']}%** 左右落袋为安)")
-            report.append(f"- 🛑 **严格止损位**：**{item['止损位']}** (跌破此价，风险约 -{item['风险%']}%，无条件走人)")
+            report.append(f"- 🎯 **第一止盈位**：**{item['止盈位']}** (预期盈 **+{item['预期盈%']}%**)")
+            report.append(f"- 🛑 **严格止损位**：**{item['止损位']}** (风险约 -{item['风险%']}%)")
             report.append(f"- 入选理由：{item['理由']}\n")
-    
-    report.extend(["## 操作纪律说明", "- 次日若开盘直接大幅高开(>3%)，放弃买入，谨防高开低走。", "- 盘中触及止盈位果断清仓；跌破止损位严格执行，不抱幻想。"])
-    
+            
     with open("reports/report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
     log("运行完成，请查看交易计划。")
