@@ -1,3 +1,17 @@
+import akshare_proxy_patch
+
+# 挂载补丁进行代理转发
+akshare_proxy_patch.install_patch(
+    "101.201.173.125", 
+    retry=30,
+    hook_domains=[
+        "push2.eastmoney.com",
+        "push2his.eastmoney.com",
+        "fund.eastmoney.com",
+    ]
+)
+
+import akshare as ak
 import os
 import time
 import traceback
