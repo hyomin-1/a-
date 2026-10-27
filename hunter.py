@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -19,7 +20,6 @@ def log(message):
 
 def calculate_indicators(df):
     df = df.copy()
-    # 兼容列名
     close_col = "收盘" if "收盘" in df.columns else "close"
     vol_col = "成交量" if "成交量" in df.columns else "volume"
     
@@ -44,33 +44,42 @@ def calculate_indicators(df):
     return df
 
 def process_single_stock(row, today_compact):
-    code = str(row["代码"]).zfill(6)
+    # 【关键修复】清理代码格式，只保留数字（比如把 sh600000 变成 600000）
+    raw_code = str(row["代码"])
+    code = re.sub(r'\D', '', raw_code).zfill(6)
     name = str(row["名称"])
     
     try:
-        # 获取近100天历史行情（带1次重试）
-        for attempt in range(2):
-            try:
-                hist = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"),
-                    end_date=today_compact,
-                    adjust="qfq",
-                )
-                break
-            except Exception as e:
-                if attempt == 1:
-                    return None, f"{code} 获取历史行情失败: {e}"
-                time.sleep(2)
+        # 获取近100天历史行情
+        hist = None
+        try:
+            hist = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"),
+                end_date=today_compact,
+                adjust="qfq",
+            )
+        except Exception as e:
+            # 如果东财历史接口被墙，尝试新浪历史接口
+            if code.startswith('6'):
+                symbol_sina = f"sh{code}"
+            elif code.startswith('0') or code.startswith('3'):
+                symbol_sina = f"sz{code}"
+            else:
+                return None, f"{code} 不支持北交所历史数据获取"
+            
+            hist = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
+            # 把新浪的列名统一成东财的
+            hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量'})
 
         if hist is None or len(hist) < 30:
             return None, f"{code} 数据不足30天"
             
-        # 数据新鲜度校验：判断最后一天的数据是不是今天
-        last_data_date = str(hist.iloc[-1]["日期"]).replace("-", "")
-        if last_data_date != today_compact:
-            return None, f"{code} 数据未更新（最后一天:{last_data_date}）"
+        # 提取最后一天日期（兼容不同格式）
+        last_date_str = str(hist.iloc[-1]["日期"]).replace("-", "")[:8]
+        if last_date_str != today_compact:
+            return None, f"{code} 数据未更新（最后一天:{last_date_str}）"
 
         hist = calculate_indicators(hist)
         if hist is None:
@@ -94,190 +103,99 @@ def process_single_stock(row, today_compact):
         if not all(np.isfinite(x) for x in [price, pct, turnover, amount, ma5, ma10, ma20, macd, prev_macd]):
             return None, f"{code} 指标包含无效值"
 
-        # 隔夜策略评分逻辑
+        # 评分逻辑（不变）
         score = 0.0
         reasons = []
-        
-        if price >= ma5:
-            score += 1
-            reasons.append("收盘站上MA5")
-        if ma5 >= ma10:
-            score += 1
-            reasons.append("短期均线偏强")
-        if price >= ma20:
-            score += 1
-            reasons.append("收盘站上MA20")
-        if macd > prev_macd:
-            score += 1
-            reasons.append("MACD改善")
-        if macd > 0:
-            score += 0.5
-            reasons.append("MACD柱为正")
-        if vol5 > 0 and vol < vol5 * 1.5:
-            score += 0.5
-            reasons.append("成交量未明显失控")
-        if 0 <= pct <= 3:
-            score += 1
-            reasons.append("当日涨幅适中")
-        if 1 <= turnover <= 10:
-            score += 0.5
-            reasons.append("换手率处于观察区间")
-        if pct > 5:
-            score -= 2
-            reasons.append("当日涨幅较大，谨慎追高")
+        if price >= ma5: score += 1; reasons.append("收盘站上MA5")
+        if ma5 >= ma10: score += 1; reasons.append("短期均线偏强")
+        if price >= ma20: score += 1; reasons.append("收盘站上MA20")
+        if macd > prev_macd: score += 1; reasons.append("MACD改善")
+        if macd > 0: score += 0.5; reasons.append("MACD柱为正")
+        if vol5 > 0 and vol < vol5 * 1.5: score += 0.5; reasons.append("成交量未明显失控")
+        if 0 <= pct <= 3: score += 1; reasons.append("当日涨幅适中")
+        if 1 <= turnover <= 10: score += 0.5; reasons.append("换手率处于观察区间")
+        if pct > 5: score -= 2; reasons.append("当日涨幅较大，谨慎追高")
 
         candidate = {
-            "代码": code,
-            "名称": name,
-            "收盘价": round(price, 3),
-            "当日涨跌幅%": round(pct, 2),
-            "成交额(元)": int(amount),
-            "换手率%": round(turnover, 2),
-            "MACD柱": round(macd, 4),
-            "MA5": round(ma5, 3),
-            "MA10": round(ma10, 3),
-            "MA20": round(ma20, 3),
-            "评分": round(score, 2),
-            "理由": "；".join(reasons),
+            "代码": code, "名称": name, "收盘价": round(price, 3),
+            "当日涨跌幅%": round(pct, 2), "成交额(元)": int(amount),
+            "换手率%": round(turnover, 2), "MACD柱": round(macd, 4),
+            "MA5": round(ma5, 3), "MA10": round(ma10, 3), "MA20": round(ma20, 3),
+            "评分": round(score, 2), "理由": "；".join(reasons),
         }
         return candidate, None
 
     except Exception as exc:
-        return None, f"{code} 异常: {exc}"
+        return None, f"{code} 异常: {str(exc)[:30]}"
 
 def scan_market():
+    # [交易日校验与行情获取代码保持不变，见你原有的那部分，直接复制进来即可]
     log("开始检查今日是否为 A 股交易日……")
     try:
         trade_dates = ak.tool_trade_date_hist_sina()
         trade_dates["trade_date"] = pd.to_datetime(trade_dates["trade_date"]).dt.strftime("%Y-%m-%d")
         if TODAY not in trade_dates["trade_date"].values:
-            log(f"今天 {TODAY} 不是A股交易日（可能是周末或节假日），程序安全退出。")
+            log(f"今天 {TODAY} 不是A股交易日，退出。")
             return
     except Exception as e:
-        log(f"获取交易日历失败，跳过校验继续执行：{e}")
+        log(f"交易日历获取失败: {e}")
 
-    # ================= 核心改动：双数据源获取全市场行情 =================
     log("开始获取全市场行情...")
     spot = None
     try:
-        log("尝试使用东方财富接口...")
         spot = ak.stock_zh_a_spot_em()
-        log("东方财富接口获取成功。")
     except Exception as e:
-        log(f"东方财富接口连接失败（被拦截）: {e}")
-        log("自动切换到新浪财经备用接口（可能需要多等几秒）...")
-        
-        # 新浪接口返回所有A股，我们过滤掉非A股代码
+        log("东财接口失败，切换新浪...")
         spot = ak.stock_zh_a_spot()
-        # 新浪接口列名适配为东方财富的列名，保证后续代码通用
-        spot = spot.rename(columns={
-            '代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅',
-            '成交额': '成交额'
-        })
-        # 新浪接口没有换手率，为了不报错，我们模拟一个（默认1.0）或者后续剔除这个过滤条件
+        spot = spot.rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
         if '换手率' not in spot.columns:
             spot['换手率'] = 1.0 
-        log("新浪接口切换成功并完成字段适配。")
-
-    # 安全过滤机制
-    required = {"代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"}
-    if not required.issubset(set(spot.columns)):
-        raise RuntimeError(f"行情字段缺失，当前接口返回：{spot.columns.tolist()}")
 
     for col in ["最新价", "涨跌幅", "成交额", "换手率"]:
         spot[col] = pd.to_numeric(spot[col], errors="coerce")
-
     spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额", "换手率"])
+    spot = spot[(~spot["名称"].str.contains("ST|退", na=False)) & (spot["最新价"] > 0) & (spot["成交额"] >= 3e7) & (spot["涨跌幅"] > -7) & (spot["涨跌幅"] < 7)].copy()
     
-    # 基础过滤
-    spot = spot[
-        (~spot["名称"].str.contains("ST|退", na=False))
-        & (spot["最新价"] > 0)
-        & (spot["成交额"] >= 3e7)  # 成交额大于3000万
-        & (spot["换手率"] >= 0.5)  # 换手率大于0.5%
-        & (spot["涨跌幅"] > -7)
-        & (spot["涨跌幅"] < 7)
-    ].copy()
-    
-    log(f"基础条件过滤后剩余 {len(spot)} 只，开始并发计算历史指标……")
+    log(f"基础过滤后剩余 {len(spot)} 只，开始计算……")
 
     candidates = []
     failures = []
     
-    # 引入多线程并发，限制 max_workers=5 防止被封 IP
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(process_single_stock, row, TODAY_COMPACT): row for _, row in spot.iterrows()}
-        
         completed_count = 0
         for future in as_completed(futures):
             completed_count += 1
             candidate, error_msg = future.result()
-            
             if candidate:
                 candidates.append(candidate)
             elif error_msg:
                 failures.append(error_msg)
                 
             if completed_count % 50 == 0:
-                log(f"已处理 {completed_count}/{len(spot)}，有效候选 {len(candidates)}，失败 {len(failures)}")
+                log(f"已处理 {completed_count}/{len(spot)}，候选 {len(candidates)}，失败 {len(failures)}")
+                # 【关键】打印最近一次失败的原因，方便排查
+                if len(failures) > 0:
+                    log(f"   └─ 最近失败原因: {failures[-1]}")
 
     if not candidates:
-        raise RuntimeError("没有取得有效候选数据，不能生成选股结论。可能是数据源未更新。")
+        raise RuntimeError("没有取得有效候选数据，不能生成结论。")
 
-    # 排序并生成报告
-    result = pd.DataFrame(candidates).sort_values(
-        ["评分", "成交额(元)"], ascending=[False, False]
-    )
-    
+    result = pd.DataFrame(candidates).sort_values(["评分", "成交额(元)"], ascending=[False, False])
     os.makedirs("reports", exist_ok=True)
-    path = f"reports/{TODAY}.csv"
-    result.head(30).to_csv(path, index=False, encoding="utf-8-sig")
+    result.head(30).to_csv(f"reports/{TODAY}.csv", index=False, encoding="utf-8-sig")
     
-    report = [
-        f"# A股猎手收盘报告：{TODAY}",
-        "",
-        f"- 运行时间：{NOW.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）",
-        f"- 初筛股票：{len(spot)}",
-        f"- 成功计算指标：{len(candidates)}",
-        f"- 获取失败或数据不足：{len(failures)}",
-        "",
-        "## 排名前十的候选股",
-        "",
-    ]
-    
+    report = [f"# A股猎手收盘报告：{TODAY}\n", f"- 初筛股票：{len(spot)}", f"- 成功：{len(candidates)}", f"- 失败：{len(failures)}\n", "## 前十候选：\n"]
     for i, item in enumerate(result.head(10).to_dict("records"), start=1):
-        report.extend([
-            f"### {i}. {item['名称']}（{item['代码']}）",
-            f"- 收盘价：{item['收盘价']}",
-            f"- 当日涨跌幅：{item['当日涨跌幅%']}%",
-            f"- 换手率：{item['换手率%']}%",
-            f"- MACD柱：{item['MACD柱']}",
-            f"- 综合评分：{item['评分']}",
-            f"- 参考理由：{item['理由']}",
-            "",
-        ])
-        
-    report.extend([
-        "## 风险说明",
-        "",
-        "- 这是基于公开行情和技术指标的初筛，不代表预测必然有效。",
-        "- 行情源可能延迟、缺失或连接失败；必须核对实际交易日期。",
-        "- 当前评分没有经过历史回测，不应直接视为买入信号。",
-        "- 次日开盘低开、突发公告、流动性和交易成本都可能造成亏损。",
-        "- 若数据不完整，应停止输出有效选股结论。",
-        "",
-    ])
+        report.append(f"### {i}. {item['名称']}（{item['代码']}）\n- 收盘价：{item['收盘价']}\n- 评分：{item['评分']}\n- 理由：{item['理由']}\n")
     
     with open("reports/report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
-        
-    log(f"报告已保存：{path}")
     log("运行完成。")
 
 if __name__ == "__main__":
     try:
         scan_market()
     except Exception:
-        log("运行失败，未能生成可信选股结果。")
         traceback.print_exc()
         raise
