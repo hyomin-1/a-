@@ -1,6 +1,6 @@
 name: 'A股猎手每日选股'
 
-'on':
+on:
   workflow_dispatch:
   schedule:
     - cron: '30 7 * * 1-5'
@@ -33,8 +33,8 @@ jobs:
       - name: 保存报告
         if: always()
         run: |
-          git config user.name "A股猎手机器人"
-          git config user.email "actions@users.noreply.github.com"
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
           git add reports
           git diff --cached --quiet || git commit -m "更新每日选股报告"
           git push
