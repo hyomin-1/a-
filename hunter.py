@@ -6,30 +6,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import akshare as ak
 import numpy as np
 import pandas as pd
-
-# ================= 全局网络重试会话配置 =================
-def create_retry_session(retries=3, backoff_factor=1.0, status_forcelist=(429, 500, 502, 503, 504)):
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=status_forcelist,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-GLOBAL_SESSION = create_retry_session()
-# =========================================================
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime.now(TZ)
@@ -39,208 +18,215 @@ TODAY_COMPACT = NOW.strftime("%Y%m%d")
 def log(message):
     print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] {message}", flush=True)
 
+# 计算 RSI
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def calculate_indicators(df):
     df = df.copy()
     close_col = "收盘" if "收盘" in df.columns else "close"
     vol_col = "成交量" if "成交量" in df.columns else "volume"
-    high_col = "最高" if "最高" in df.columns else "high"
-    low_col = "最低" if "最低" in df.columns else "low"
     
-    for c in [close_col, vol_col, high_col, low_col]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    
+    df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
+    df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
     df = df.dropna(subset=[close_col]).reset_index(drop=True)
 
-    if len(df) < 30:
-        return None
+    if len(df) < 20: return None
     
     close = df[close_col]
-    high = df[high_col]
-    low = df[low_col]
-    
-    df["MA5"] = close.rolling(5).mean()
+    # 核心均线：10日线
     df["MA10"] = close.rolling(10).mean()
-    df["MA20"] = close.rolling(20).mean()
+    
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["DIF"] = ema12 - ema26
     df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD"] = 2 * (df["DIF"] - df["DEA"])
-    df["成交量均值5"] = df[vol_col].rolling(5).mean()
     
-    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    df["ATR"] = tr.rolling(14).mean()
+    # RSI
+    df["RSI"] = calculate_rsi(close)
     
     return df
 
-def process_single_stock(row, today_compact):
+def get_hot_sectors():
+    """获取今日资金净流入前10的行业板块"""
+    try:
+        log("正在获取今日资金热门板块...")
+        df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
+        top_sectors = df.head(10)["名称"].tolist()
+        log(f"今日资金流入前十板块: {top_sectors}")
+        return top_sectors
+    except Exception as e:
+        log(f"板块资金获取失败: {e}")
+        return []
+
+def process_single_stock(row, today_compact, hot_sectors):
     raw_code = str(row["代码"])
     code = re.sub(r'\D', '', raw_code).zfill(6)
     name = str(row["名称"])
     
     try:
+        # 获取历史数据 (60天)
         hist = None
         try:
-            hist = ak.stock_zh_a_hist(
-                symbol=code, 
-                period="daily", 
-                start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"), 
-                end_date=today_compact, 
-                adjust="qfq"
-            )
+            hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=(NOW - timedelta(days=60)).strftime("%Y%m%d"), end_date=today_compact, adjust="qfq")
         except Exception:
             if code.startswith('6'): symbol_sina = f"sh{code}"
             elif code.startswith('0') or code.startswith('3'): symbol_sina = f"sz{code}"
-            else: return None, f"{code} 不支持"
-            
-            # 新浪日线接口切换兜底
+            else: return None
             hist = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
-            hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量', 'high': '最高', 'low': '最低'})
+            hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量'})
 
-        if hist is None or len(hist) < 30:
-            return None, f"{code} 数据不足"
+        if hist is None or len(hist) < 20: return None
             
-        last_date_str = str(hist.iloc[-1]["日期"]).replace("-", "")[:8]
-        if last_date_str != today_compact:
-            return None, f"{code} 数据未更新"
-
         hist = calculate_indicators(hist)
-        if hist is None: return None, f"{code} 指标失败"
+        if hist is None: return None
             
         last = hist.iloc[-1]
         prev = hist.iloc[-2]
         
-        price = float(last["收盘"])
-        pct = float(row["涨跌幅"])
-        turnover = float(row["换手率"])
-        amount = float(row["成交额"])
-        ma5 = float(last["MA5"])
+        # 历史指标
         ma10 = float(last["MA10"])
-        ma20 = float(last["MA20"])
         macd = float(last["MACD"])
         prev_macd = float(prev["MACD"])
-        vol = float(last["成交量"])
-        vol5 = float(last["成交量均值5"])
-        atr = float(last["ATR"])
+        rsi = float(last["RSI"])
         
-        if not np.isfinite(atr) or atr <= 0: atr = price * 0.03
-
+        # 实时盘口指标
+        price = float(row["最新价"])
+        pct = float(row["涨跌幅"])
+        volume_ratio = float(row["量比"]) if not pd.isna(row["量比"]) else 0
+        weibi = float(row["委比"]) if not pd.isna(row["委比"]) else 0
+        outer = float(row["外盘"]) if not pd.isna(row["外盘"]) else 0
+        inner = float(row["内盘"]) if not pd.isna(row["内盘"]) else 0
+        
+        # ================= 10分制评分系统 =================
         score = 0.0
-        reasons = []
-        if price >= ma5: score += 1; reasons.append("站上MA5")
-        if ma5 >= ma10: score += 1; reasons.append("短期均线偏强")
-        if price >= ma20: score += 1; reasons.append("站上MA20")
-        if macd > prev_macd: score += 1; reasons.append("MACD改善")
-        if macd > 0: score += 0.5; reasons.append("MACD红柱")
-        if vol5 > 0 and vol < vol5 * 1.5: score += 0.5; reasons.append("量能温和")
-        if 0 <= pct <= 3: score += 1; reasons.append("涨幅适中")
-        if 1 <= turnover <= 10: score += 0.5; reasons.append("换手活跃")
-        if pct > 5: score -= 2; reasons.append("追高风险")
+        
+        # 1. 趋势 (2分)：站上10日线
+        if price > ma10: 
+            score += 2
+            
+        # 2. MACD (2分)
+        if macd > prev_macd: score += 1
+        if macd > 0: score += 1
+            
+        # 3. RSI 强势区 (1.5分)：50~75属于主升浪，超过80属于超买风险
+        if 50 <= rsi <= 75: 
+            score += 1.5
+            
+        # 4. 盘口量价 (2.5分)
+        if 1.2 <= volume_ratio <= 3.0: score += 1  # 温和放量
+        if weibi > 10: score += 0.5                # 买盘压单
+        if outer > inner: score += 1               # 主动买大于主动卖
+            
+        # 5. 板块资金与形态 (2分)
+        # 检查是否在热门板块内 (粗略匹配，通过东财个股行业属性)
+        is_hot = False
+        # 为了速度，这里用涨幅和量比简单替代，实际应用可引入东财板块API匹配
+        if 1.0 <= pct <= 4.5:
+            score += 2
+            
+        # 基础门槛：没站上10日线或量比不足1的直接淘汰
+        if price <= ma10 or volume_ratio < 1.0:
+            return None
 
-        target_price_1 = price + (atr * 1.5)
-        stop_loss = min(ma5, price - (atr * 1.5))
-        if stop_loss >= price: stop_loss = price * 0.97
-
-        exp_profit_pct = ((target_price_1 - price) / price) * 100
-        risk_pct = ((price - stop_loss) / price) * 100
+        # ================= 止盈止损 =================
+        # 目标：次日溢价 1.5% (稳清仓) - 2%
+        target_price = round(price * 1.015, 2) 
+        stop_loss = round(price * 0.98, 2)     # 严格 2% 止损
 
         candidate = {
-            "代码": code, "名称": name, "收盘价": round(price, 2),
-            "当日涨跌幅%": round(pct, 2), "成交额(万)": int(amount/10000),
-            "评分": round(score, 2),
-            "止盈位": round(target_price_1, 2),
-            "预期盈%": round(exp_profit_pct, 2),
-            "止损位": round(stop_loss, 2),
-            "风险%": round(risk_pct, 2),
-            "理由": "；".join(reasons),
+            "代码": code, "名称": name, "最新价": price,
+            "涨幅%": round(pct, 2), "量比": round(volume_ratio, 2),
+            "委比": round(weibi, 1), "外/内": round(outer/inner, 2) if inner>0 else 99,
+            "RSI": round(rsi, 1), "评分": round(score, 1),
+            "次日止盈": target_price, "止损": stop_loss
         }
-        return candidate, None
+        return candidate
 
     except Exception:
-        return None, f"{code} 异常"
+        return None
 
 def scan_market():
+    # 1. 检查交易日
     try:
         trade_dates = ak.tool_trade_date_hist_sina()
         trade_dates["trade_date"] = pd.to_datetime(trade_dates["trade_date"]).dt.strftime("%Y-%m-%d")
         if TODAY not in trade_dates["trade_date"].values:
             log(f"今天 {TODAY} 不是A股交易日，退出。")
             return
-    except Exception as e:
-        log(f"交易日历获取失败: {e}")
+    except Exception: pass
 
-    spot = None
+    # 2. 获取热门板块资金
+    hot_sectors = get_hot_sectors()
+
+    # 3. 获取全市场快照
+    log("获取全市场实时盘口数据...")
     try:
-        log("正在获取沪深全市场实时行情...")
         spot = ak.stock_zh_a_spot_em()
-    except Exception as e:
-        log(f"东财实时接口异常({e})，尝试新浪快照兜底...")
-        # 备用链路增加短暂休眠以缓解频控
-        time.sleep(2) 
-        try:
-            spot = ak.stock_zh_a_spot().rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
-            if '换手率' not in spot.columns: spot['换手率'] = 1.0
-        except Exception as e2:
-            log(f"新浪快照接口同样超时: {e2}，执行最后一次等待重试...")
-            time.sleep(5)
-            spot = ak.stock_zh_a_spot_em()
+    except Exception:
+        log("东财快照失败，切新浪兜底...")
+        spot = ak.stock_zh_a_spot().rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额', '成交量': '成交量'})
+        for col in ["换手率", "量比", "委比", "外盘", "内盘"]:
+            if col not in spot.columns: spot[col] = np.nan
 
-    for col in ["最新价", "涨跌幅", "成交额", "换手率"]:
-        spot[col] = pd.to_numeric(spot[col], errors="coerce")
-    spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额", "换手率"])
-    
+    # 4. 基础剔除（去掉ST、北交所、科创板、成交额太小、绿盘的）
+    spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额"])
     spot["纯代码"] = spot["代码"].astype(str).str.extract(r'(\d+)')[0].fillna('')
+    
     spot = spot[
         (~spot["名称"].str.contains("ST|退", na=False))
         & (~spot["纯代码"].str.startswith(('8', '4', '9', '688')))
-        & (spot["最新价"] > 0) & (spot["成交额"] >= 3e7) 
-        & (spot["换手率"] >= 0.5) & (spot["涨跌幅"] > -7) & (spot["涨跌幅"] < 7)
+        & (spot["最新价"] > 2) 
+        & (spot["成交额"] >= 50000000)  # 成交额大于5000万，保证流动性
+        & (spot["涨跌幅"] > 0) & (spot["涨跌幅"] < 6.0) # 尾盘只做红盘
     ].copy()
 
-    log(f"基础过滤后剩余 {len(spot)} 只，开始计算……")
+    log(f"基础过滤后剩余 {len(spot)} 只，开始深度计算...")
+
+    # 5. 并发精算
     candidates = []
-    
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(process_single_stock, row, TODAY_COMPACT): row for _, row in spot.iterrows()}
-        completed_count = 0
+        futures = {executor.submit(process_single_stock, row, TODAY_COMPACT, hot_sectors): row for _, row in spot.iterrows()}
         for future in as_completed(futures):
-            completed_count += 1
-            c, _ = future.result()
-            if c: candidates.append(c)
-            if completed_count % 100 == 0:
-                log(f"进度：已扫描 {completed_count}/{len(spot)}，入选 {len(candidates)} 只")
+            res = future.result()
+            if res: candidates.append(res)
 
     if not candidates:
-        raise RuntimeError("没有取得有效候选数据。")
+        raise RuntimeError("今日无符合条件的尾盘狙击标的。")
 
+    # 6. 排序输出
     df_all = pd.DataFrame(candidates)
-    df_top = df_all[df_all["评分"] >= 4.0].sort_values(["评分", "成交额(万)"], ascending=[False, False])
-    result = df_top.head(3)
+    # 必须 >= 7 分才入选，宁缺毋滥
+    df_top = df_all[df_all["评分"] >= 7.0].sort_values(["评分", "量比"], ascending=[False, False])
+    result = df_top.head(3) # 只选前3支
     
     os.makedirs("reports", exist_ok=True)
-    if len(result) > 0:
-        result.to_csv(f"reports/{TODAY}.csv", index=False, encoding="utf-8-sig")
-    
-    report = [f"# A股猎手交易计划：{TODAY}\n", f"- 达标强信号股票：{len(result)} 只\n"]
-    
     if len(result) == 0:
-        report.append("> 今日无股票达到 4.0 分及格线，**建议空仓休息**。\n")
-    else:
-        for i, item in enumerate(result.to_dict("records"), start=1):
-            report.append(f"### {i}. {item['名称']}（{item['代码']}） | 评分: {item['评分']}")
-            report.append(f"- **收盘价**：{item['收盘价']} (当日涨幅 {item['当日涨跌幅%']}%)")
-            report.append(f"- 🎯 **第一止盈位**：**{item['止盈位']}** (预期盈 **+{item['预期盈%']}%**)")
-            report.append(f"- 🛑 **严格止损位**：**{item['止损位']}** (风险约 -{item['风险%']}%)")
-            report.append(f"- 入选理由：{item['理由']}\n")
-            
+        log("⚠️ 今日无股票达到 7.0 分及格线，建议空仓休息。")
+        return
+        
+    result.to_csv(f"reports/{TODAY}.csv", index=False, encoding="utf-8-sig")
+    
+    report = [f"# 尾盘狙击计划：{TODAY}\n", f"- 达标标的：{len(result)} 只\n"]
+    for i, item in enumerate(result.to_dict("records"), start=1):
+        report.append(f"### {i}. {item['名称']}（{item['代码']}） | 评分: {item['评分']}")
+        report.append(f"- **当前价**：{item['最新价']} (涨幅 {item['涨幅%']}%)")
+        report.append(f"- 🎯 **次日止盈**：**{item['次日止盈']}** (+1.5% 离场)")
+        report.append(f"- 🛑 **严格止损**：**{item['止损']}** (-2.0% 破位走人)")
+        report.append(f"- 📊 盘口数据：量比 {item['量比']} | 委比 {item['委比']}% | 外/内 {item['外/内']} | RSI {item['RSI']}\n")
+        
     with open("reports/report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
-    log("运行完成，请查看交易计划。")
+    log("运行完成，请查看报告。")
 
 if __name__ == "__main__":
     try:
         scan_market()
     except Exception:
         traceback.print_exc()
-        raise
