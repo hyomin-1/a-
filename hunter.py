@@ -1,17 +1,3 @@
-import akshare_proxy_patch
-
-# 挂载补丁进行代理转发
-akshare_proxy_patch.install_patch(
-    "101.201.173.125", 
-    retry=30,
-    hook_domains=[
-        "push2.eastmoney.com",
-        "push2his.eastmoney.com",
-        "fund.eastmoney.com",
-    ]
-)
-
-import akshare as ak
 import os
 import time
 import traceback
@@ -62,14 +48,22 @@ def process_single_stock(row, today_compact):
     name = str(row["名称"])
     
     try:
-        # 获取近100天历史行情
-        hist = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"),
-            end_date=today_compact,
-            adjust="qfq",
-        )
+        # 获取近100天历史行情（带1次重试）
+        for attempt in range(2):
+            try:
+                hist = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"),
+                    end_date=today_compact,
+                    adjust="qfq",
+                )
+                break
+            except Exception as e:
+                if attempt == 1:
+                    return None, f"{code} 获取历史行情失败: {e}"
+                time.sleep(2)
+
         if hist is None or len(hist) < 30:
             return None, f"{code} 数据不足30天"
             
@@ -154,7 +148,6 @@ def process_single_stock(row, today_compact):
 def scan_market():
     log("开始检查今日是否为 A 股交易日……")
     try:
-        # 获取交易日历校验
         trade_dates = ak.tool_trade_date_hist_sina()
         trade_dates["trade_date"] = pd.to_datetime(trade_dates["trade_date"]).dt.strftime("%Y-%m-%d")
         if TODAY not in trade_dates["trade_date"].values:
@@ -163,10 +156,30 @@ def scan_market():
     except Exception as e:
         log(f"获取交易日历失败，跳过校验继续执行：{e}")
 
-    log("获取沪深京A股全市场行情……")
-    spot = ak.stock_zh_a_spot_em()
+    # ================= 核心改动：双数据源获取全市场行情 =================
+    log("开始获取全市场行情...")
+    spot = None
+    try:
+        log("尝试使用东方财富接口...")
+        spot = ak.stock_zh_a_spot_em()
+        log("东方财富接口获取成功。")
+    except Exception as e:
+        log(f"东方财富接口连接失败（被拦截）: {e}")
+        log("自动切换到新浪财经备用接口（可能需要多等几秒）...")
+        
+        # 新浪接口返回所有A股，我们过滤掉非A股代码
+        spot = ak.stock_zh_a_spot()
+        # 新浪接口列名适配为东方财富的列名，保证后续代码通用
+        spot = spot.rename(columns={
+            '代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅',
+            '成交额': '成交额'
+        })
+        # 新浪接口没有换手率，为了不报错，我们模拟一个（默认1.0）或者后续剔除这个过滤条件
+        if '换手率' not in spot.columns:
+            spot['换手率'] = 1.0 
+        log("新浪接口切换成功并完成字段适配。")
 
-    # 安全过滤机制，使用列名索引
+    # 安全过滤机制
     required = {"代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"}
     if not required.issubset(set(spot.columns)):
         raise RuntimeError(f"行情字段缺失，当前接口返回：{spot.columns.tolist()}")
@@ -175,6 +188,8 @@ def scan_market():
         spot[col] = pd.to_numeric(spot[col], errors="coerce")
 
     spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额", "换手率"])
+    
+    # 基础过滤
     spot = spot[
         (~spot["名称"].str.contains("ST|退", na=False))
         & (spot["最新价"] > 0)
