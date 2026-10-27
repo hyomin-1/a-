@@ -44,13 +44,11 @@ def calculate_indicators(df):
     return df
 
 def process_single_stock(row, today_compact):
-    # 【关键修复】清理代码格式，只保留数字（比如把 sh600000 变成 600000）
     raw_code = str(row["代码"])
     code = re.sub(r'\D', '', raw_code).zfill(6)
     name = str(row["名称"])
     
     try:
-        # 获取近100天历史行情
         hist = None
         try:
             hist = ak.stock_zh_a_hist(
@@ -61,22 +59,20 @@ def process_single_stock(row, today_compact):
                 adjust="qfq",
             )
         except Exception as e:
-            # 如果东财历史接口被墙，尝试新浪历史接口
+            # 备用新浪接口
             if code.startswith('6'):
                 symbol_sina = f"sh{code}"
             elif code.startswith('0') or code.startswith('3'):
                 symbol_sina = f"sz{code}"
             else:
-                return None, f"{code} 不支持北交所历史数据获取"
+                return None, f"{code} 代码格式不支持"
             
             hist = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
-            # 把新浪的列名统一成东财的
             hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量'})
 
         if hist is None or len(hist) < 30:
             return None, f"{code} 数据不足30天"
             
-        # 提取最后一天日期（兼容不同格式）
         last_date_str = str(hist.iloc[-1]["日期"]).replace("-", "")[:8]
         if last_date_str != today_compact:
             return None, f"{code} 数据未更新（最后一天:{last_date_str}）"
@@ -103,7 +99,6 @@ def process_single_stock(row, today_compact):
         if not all(np.isfinite(x) for x in [price, pct, turnover, amount, ma5, ma10, ma20, macd, prev_macd]):
             return None, f"{code} 指标包含无效值"
 
-        # 评分逻辑（不变）
         score = 0.0
         reasons = []
         if price >= ma5: score += 1; reasons.append("收盘站上MA5")
@@ -129,7 +124,6 @@ def process_single_stock(row, today_compact):
         return None, f"{code} 异常: {str(exc)[:30]}"
 
 def scan_market():
-    # [交易日校验与行情获取代码保持不变，见你原有的那部分，直接复制进来即可]
     log("开始检查今日是否为 A 股交易日……")
     try:
         trade_dates = ak.tool_trade_date_hist_sina()
@@ -154,9 +148,29 @@ def scan_market():
     for col in ["最新价", "涨跌幅", "成交额", "换手率"]:
         spot[col] = pd.to_numeric(spot[col], errors="coerce")
     spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额", "换手率"])
-    spot = spot[(~spot["名称"].str.contains("ST|退", na=False)) & (spot["最新价"] > 0) & (spot["成交额"] >= 3e7) & (spot["涨跌幅"] > -7) & (spot["涨跌幅"] < 7)].copy()
     
-    log(f"基础过滤后剩余 {len(spot)} 只，开始计算……")
+    # ================= 核心改动：剔除北交所和科创板 =================
+    log("开始剔除北交所(8,4,9开头)和科创板(688开头)股票...")
+    # 提取纯数字代码用于判断
+    spot["纯代码"] = spot["代码"].astype(str).str.extract(r'(\d+)')[0].fillna('')
+    
+    # 过滤条件：
+    # 1. 不是ST或退市
+    # 2. 不是北交所 (8, 4, 9开头)
+    # 3. 不是科创板 (688开头)
+    spot = spot[
+        (~spot["名称"].str.contains("ST|退", na=False))
+        & (~spot["纯代码"].str.startswith(('8', '4', '9')))
+        & (~spot["纯代码"].str.startswith('688'))
+        & (spot["最新价"] > 0)
+        & (spot["成交额"] >= 3e7)  # 成交额大于3000万
+        & (spot["换手率"] >= 0.5)  # 换手率大于0.5%
+        & (spot["涨跌幅"] > -7)
+        & (spot["涨跌幅"] < 7)
+    ].copy()
+    # =================================================================
+
+    log(f"基础过滤(已剔除北交所/科创板)后剩余 {len(spot)} 只，开始计算……")
 
     candidates = []
     failures = []
@@ -174,7 +188,6 @@ def scan_market():
                 
             if completed_count % 50 == 0:
                 log(f"已处理 {completed_count}/{len(spot)}，候选 {len(candidates)}，失败 {len(failures)}")
-                # 【关键】打印最近一次失败的原因，方便排查
                 if len(failures) > 0:
                     log(f"   └─ 最近失败原因: {failures[-1]}")
 
