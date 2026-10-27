@@ -1,3 +1,4 @@
 akshare
 pandas
 numpy
+akshare-proxy-patch
