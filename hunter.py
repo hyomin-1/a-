@@ -22,15 +22,22 @@ def calculate_indicators(df):
     df = df.copy()
     close_col = "收盘" if "收盘" in df.columns else "close"
     vol_col = "成交量" if "成交量" in df.columns else "volume"
+    high_col = "最高" if "最高" in df.columns else "high"
+    low_col = "最低" if "最低" in df.columns else "low"
     
-    df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
-    df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
+    # 强制转换数值
+    for c in [close_col, vol_col, high_col, low_col]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    
     df = df.dropna(subset=[close_col]).reset_index(drop=True)
 
     if len(df) < 30:
         return None
     
     close = df[close_col]
+    high = df[high_col]
+    low = df[low_col]
+    
     df["MA5"] = close.rolling(5).mean()
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
@@ -40,7 +47,11 @@ def calculate_indicators(df):
     df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD"] = 2 * (df["DIF"] - df["DEA"])
     df["成交量均值5"] = df[vol_col].rolling(5).mean()
-    df["成交量均值20"] = df[vol_col].rolling(20).mean()
+    
+    # 计算 ATR (用于动态止盈止损)
+    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    df["ATR"] = tr.rolling(14).mean()
+    
     return df
 
 def process_single_stock(row, today_compact):
@@ -51,35 +62,23 @@ def process_single_stock(row, today_compact):
     try:
         hist = None
         try:
-            hist = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"),
-                end_date=today_compact,
-                adjust="qfq",
-            )
-        except Exception as e:
-            # 备用新浪接口
-            if code.startswith('6'):
-                symbol_sina = f"sh{code}"
-            elif code.startswith('0') or code.startswith('3'):
-                symbol_sina = f"sz{code}"
-            else:
-                return None, f"{code} 代码格式不支持"
-            
+            hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=(NOW - timedelta(days=100)).strftime("%Y%m%d"), end_date=today_compact, adjust="qfq")
+        except Exception:
+            if code.startswith('6'): symbol_sina = f"sh{code}"
+            elif code.startswith('0') or code.startswith('3'): symbol_sina = f"sz{code}"
+            else: return None, f"{code} 不支持"
             hist = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
-            hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量'})
+            hist = hist.rename(columns={'date': '日期', 'close': '收盘', 'volume': '成交量', 'high': '最高', 'low': '最低'})
 
         if hist is None or len(hist) < 30:
-            return None, f"{code} 数据不足30天"
+            return None, f"{code} 数据不足"
             
         last_date_str = str(hist.iloc[-1]["日期"]).replace("-", "")[:8]
         if last_date_str != today_compact:
-            return None, f"{code} 数据未更新（最后一天:{last_date_str}）"
+            return None, f"{code} 数据未更新"
 
         hist = calculate_indicators(hist)
-        if hist is None:
-            return None, f"{code} 指标计算失败"
+        if hist is None: return None, f"{code} 指标失败"
             
         last = hist.iloc[-1]
         prev = hist.iloc[-2]
@@ -95,36 +94,55 @@ def process_single_stock(row, today_compact):
         prev_macd = float(prev["MACD"])
         vol = float(last["成交量"])
         vol5 = float(last["成交量均值5"])
+        atr = float(last["ATR"])
         
-        if not all(np.isfinite(x) for x in [price, pct, turnover, amount, ma5, ma10, ma20, macd, prev_macd]):
-            return None, f"{code} 指标包含无效值"
+        if not np.isfinite(atr) or atr <= 0: atr = price * 0.03 # 兜底波动率
 
+        # ================= 评分逻辑 =================
         score = 0.0
         reasons = []
-        if price >= ma5: score += 1; reasons.append("收盘站上MA5")
+        if price >= ma5: score += 1; reasons.append("站上MA5")
         if ma5 >= ma10: score += 1; reasons.append("短期均线偏强")
-        if price >= ma20: score += 1; reasons.append("收盘站上MA20")
+        if price >= ma20: score += 1; reasons.append("站上MA20")
         if macd > prev_macd: score += 1; reasons.append("MACD改善")
-        if macd > 0: score += 0.5; reasons.append("MACD柱为正")
-        if vol5 > 0 and vol < vol5 * 1.5: score += 0.5; reasons.append("成交量未明显失控")
-        if 0 <= pct <= 3: score += 1; reasons.append("当日涨幅适中")
-        if 1 <= turnover <= 10: score += 0.5; reasons.append("换手率处于观察区间")
-        if pct > 5: score -= 2; reasons.append("当日涨幅较大，谨慎追高")
+        if macd > 0: score += 0.5; reasons.append("MACD红柱")
+        if vol5 > 0 and vol < vol5 * 1.5: score += 0.5; reasons.append("量能温和")
+        if 0 <= pct <= 3: score += 1; reasons.append("涨幅适中")
+        if 1 <= turnover <= 10: score += 0.5; reasons.append("换手活跃")
+        if pct > 5: score -= 2; reasons.append("追高风险")
+
+        # ================= 智能交易计划（止盈止损） =================
+        # 目标1：基于 1.5 倍 ATR 的预期涨幅（最稳的日内波动利润）
+        target_price_1 = price + (atr * 1.5)
+        
+        # 目标2：近期高点压制或 MA20 压制
+        recent_high = float(hist['最高'].iloc[-10:].max()) if '最高' in hist.columns else price * 1.05
+        target_price_2 = max(target_price_1, recent_high)
+        
+        # 止损：跌破 MA5，或者固定 2 倍 ATR
+        stop_loss = min(ma5, price - (atr * 1.5))
+        if stop_loss >= price: stop_loss = price * 0.97 # 防止止损价高于现价
+
+        exp_profit_pct = ((target_price_1 - price) / price) * 100
+        risk_pct = ((price - stop_loss) / price) * 100
 
         candidate = {
-            "代码": code, "名称": name, "收盘价": round(price, 3),
-            "当日涨跌幅%": round(pct, 2), "成交额(元)": int(amount),
-            "换手率%": round(turnover, 2), "MACD柱": round(macd, 4),
-            "MA5": round(ma5, 3), "MA10": round(ma10, 3), "MA20": round(ma20, 3),
-            "评分": round(score, 2), "理由": "；".join(reasons),
+            "代码": code, "名称": name, "收盘价": round(price, 2),
+            "当日涨跌幅%": round(pct, 2), "成交额(万)": int(amount/10000),
+            "评分": round(score, 2),
+            "止盈位": round(target_price_1, 2),
+            "预期盈%": round(exp_profit_pct, 2),
+            "止损位": round(stop_loss, 2),
+            "风险%": round(risk_pct, 2),
+            "理由": "；".join(reasons),
         }
         return candidate, None
 
     except Exception as exc:
-        return None, f"{code} 异常: {str(exc)[:30]}"
+        return None, f"{code} 异常"
 
 def scan_market():
-    log("开始检查今日是否为 A 股交易日……")
+    # 交易日校验与行情获取
     try:
         trade_dates = ak.tool_trade_date_hist_sina()
         trade_dates["trade_date"] = pd.to_datetime(trade_dates["trade_date"]).dt.strftime("%Y-%m-%d")
@@ -134,77 +152,62 @@ def scan_market():
     except Exception as e:
         log(f"交易日历获取失败: {e}")
 
-    log("开始获取全市场行情...")
     spot = None
     try:
         spot = ak.stock_zh_a_spot_em()
-    except Exception as e:
-        log("东财接口失败，切换新浪...")
-        spot = ak.stock_zh_a_spot()
-        spot = spot.rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
-        if '换手率' not in spot.columns:
-            spot['换手率'] = 1.0 
+    except Exception:
+        spot = ak.stock_zh_a_spot().rename(columns={'代码': '代码', '名称': '名称', '最新价': '最新价', '涨跌幅': '涨跌幅', '成交额': '成交额'})
+        if '换手率' not in spot.columns: spot['换手率'] = 1.0 
 
     for col in ["最新价", "涨跌幅", "成交额", "换手率"]:
         spot[col] = pd.to_numeric(spot[col], errors="coerce")
     spot = spot.dropna(subset=["最新价", "涨跌幅", "成交额", "换手率"])
     
-    # ================= 核心改动：剔除北交所和科创板 =================
-    log("开始剔除北交所(8,4,9开头)和科创板(688开头)股票...")
-    # 提取纯数字代码用于判断
     spot["纯代码"] = spot["代码"].astype(str).str.extract(r'(\d+)')[0].fillna('')
-    
-    # 过滤条件：
-    # 1. 不是ST或退市
-    # 2. 不是北交所 (8, 4, 9开头)
-    # 3. 不是科创板 (688开头)
     spot = spot[
         (~spot["名称"].str.contains("ST|退", na=False))
-        & (~spot["纯代码"].str.startswith(('8', '4', '9')))
-        & (~spot["纯代码"].str.startswith('688'))
-        & (spot["最新价"] > 0)
-        & (spot["成交额"] >= 3e7)  # 成交额大于3000万
-        & (spot["换手率"] >= 0.5)  # 换手率大于0.5%
-        & (spot["涨跌幅"] > -7)
-        & (spot["涨跌幅"] < 7)
+        & (~spot["纯代码"].str.startswith(('8', '4', '9', '688')))
+        & (spot["最新价"] > 0) & (spot["成交额"] >= 3e7) 
+        & (spot["换手率"] >= 0.5) & (spot["涨跌幅"] > -7) & (spot["涨跌幅"] < 7)
     ].copy()
-    # =================================================================
 
-    log(f"基础过滤(已剔除北交所/科创板)后剩余 {len(spot)} 只，开始计算……")
-
+    log(f"基础过滤后剩余 {len(spot)} 只，开始计算……")
     candidates = []
-    failures = []
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(process_single_stock, row, TODAY_COMPACT): row for _, row in spot.iterrows()}
-        completed_count = 0
         for future in as_completed(futures):
-            completed_count += 1
-            candidate, error_msg = future.result()
-            if candidate:
-                candidates.append(candidate)
-            elif error_msg:
-                failures.append(error_msg)
-                
-            if completed_count % 50 == 0:
-                log(f"已处理 {completed_count}/{len(spot)}，候选 {len(candidates)}，失败 {len(failures)}")
-                if len(failures) > 0:
-                    log(f"   └─ 最近失败原因: {failures[-1]}")
+            c, _ = future.result()
+            if c: candidates.append(c)
 
     if not candidates:
-        raise RuntimeError("没有取得有效候选数据，不能生成结论。")
+        raise RuntimeError("没有取得有效候选数据。")
 
-    result = pd.DataFrame(candidates).sort_values(["评分", "成交额(元)"], ascending=[False, False])
-    os.makedirs("reports", exist_ok=True)
-    result.head(30).to_csv(f"reports/{TODAY}.csv", index=False, encoding="utf-8-sig")
+    df_all = pd.DataFrame(candidates)
+    df_top = df_all[df_all["评分"] >= 4.0].sort_values(["评分", "成交额(万)"], ascending=[False, False])
+    result = df_top.head(3)
     
-    report = [f"# A股猎手收盘报告：{TODAY}\n", f"- 初筛股票：{len(spot)}", f"- 成功：{len(candidates)}", f"- 失败：{len(failures)}\n", "## 前十候选：\n"]
-    for i, item in enumerate(result.head(10).to_dict("records"), start=1):
-        report.append(f"### {i}. {item['名称']}（{item['代码']}）\n- 收盘价：{item['收盘价']}\n- 评分：{item['评分']}\n- 理由：{item['理由']}\n")
+    os.makedirs("reports", exist_ok=True)
+    if len(result) > 0:
+        result.to_csv(f"reports/{TODAY}.csv", index=False, encoding="utf-8-sig")
+    
+    report = [f"# A股猎手交易计划：{TODAY}\n", f"- 达标强信号股票：{len(result)} 只\n"]
+    
+    if len(result) == 0:
+        report.append("> 今日无股票达到 4.0 分及格线，**建议空仓休息**。\n")
+    else:
+        for i, item in enumerate(result.to_dict("records"), start=1):
+            report.append(f"### {i}. {item['名称']}（{item['代码']}） | 评分: {item['评分']}")
+            report.append(f"- **收盘价**：{item['收盘价']} (当日涨幅 {item['当日涨跌幅%']}%)")
+            report.append(f"- 🎯 **第一止盈位**：**{item['止盈位']}** (预期盈 **+{item['预期盈%']}%** 左右落袋为安)")
+            report.append(f"- 🛑 **严格止损位**：**{item['止损位']}** (跌破此价，风险约 -{item['风险%']}%，无条件走人)")
+            report.append(f"- 入选理由：{item['理由']}\n")
+    
+    report.extend(["## 操作纪律说明", "- 次日若开盘直接大幅高开(>3%)，放弃买入，谨防高开低走。", "- 盘中触及止盈位果断清仓；跌破止损位严格执行，不抱幻想。"])
     
     with open("reports/report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
-    log("运行完成。")
+    log("运行完成，请查看交易计划。")
 
 if __name__ == "__main__":
     try:
