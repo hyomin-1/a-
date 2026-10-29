@@ -1,4 +1,4 @@
-akshare
-pandas
+akshare>=1.18,<2
+pandas>=2,<3
 numpy
 akshare-proxy-patch
