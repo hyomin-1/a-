@@ -1,30 +1,35 @@
-name: A股猎手新版测试
+name: A股尾盘筛选
 
 on:
-  push:
-    branches:
-      - ashare-1430-test
-  workflow_dispatch:
+  workflow_dispatch:  # 只保留手动触发，随时可跑
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  test:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: 下载仓库代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 配置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: pip
+          python-version: '3.11'
 
       - name: 安装依赖
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: 运行离线测试
-        run: python -m unittest -v test_engine.py
+      - name: 运行引擎
+        run: python engine.py
+
+      - name: 提交报告
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          git diff --staged --quiet || git commit -m "reports: $(date -u +%F)"
+          git push
