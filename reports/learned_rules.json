@@ -1,8 +1,4 @@
 {
-  "strategy_id": "a-share-v1-27d32c79d642",
-  "samples": 0,
-  "dates": 0,
-  "rules": [],
-  "apply_learning": true,
-  "note": "相关特征统计，不是因果"
+  "说明": "根据历史推荐T+1结果统计",
+  "规则": {}
 }
