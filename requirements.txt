@@ -1,4 +1,3 @@
 akshare>=1.18.0,<2
 pandas>=2.0,<3
 numpy>=1.24,<3
-akshare-proxy-patch
