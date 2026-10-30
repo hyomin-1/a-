@@ -1,10 +1,13 @@
 name: A股猎手任务
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: '10 6 * * 1-5'
+    - cron: '30 6 * * 1-5'
+
 permissions:
   contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
