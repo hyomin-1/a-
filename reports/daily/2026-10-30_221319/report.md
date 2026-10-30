@@ -1,0 +1,17 @@
+# A股猎手运行失败
+
+{
+  "state": "运行失败，未生成有效选股结果",
+  "version": "anytime-v2",
+  "started_at": "2026-10-30T22:13:19.650849+08:00",
+  "errors": [
+    {
+      "task": "spot",
+      "error": "阶段截止，任务已终止"
+    },
+    {
+      "error": "RuntimeError: 全市场快照获取失败；本轮不输出虚假空选股结果"
+    }
+  ],
+  "mode": "daily"
+}
