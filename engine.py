@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""随时可运行的筛选与复盘。采用新浪+腾讯接口。"""
+"""随时可运行的筛选与复盘。盘中读实时，盘后读收盘。采用新浪+腾讯接口。"""
 from __future__ import annotations
 import argparse
 import csv
@@ -22,7 +22,8 @@ DEFAULTS = {
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
-    "max_minute_age_seconds": 900, "min_minute_bars": 180,
+    # 删除了 max_minute_age_seconds，不再限制数据新鲜度
+    "min_minute_bars": 180,
     "allow_chinext": False, "min_market_breadth": 0.35,
     "target_net_pct": 0.0, "stop_net_pct": -1.5, "exit_time": "10:30:00",
     "round_trip_cost_pct": 0.20, "entry_slippage_pct": 0.05,
@@ -131,9 +132,11 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     if len(bars) < cfg["min_minute_bars"]:
         raise ValueError("当日有效分钟线不足")
     latest = bars[-1]
-    if (asof - latest["ts"]).total_seconds() > cfg["max_minute_age_seconds"]:
-        raise ValueError("分钟行情过期")
     
+    # 移除了行情过期判断，只要拿到当天分钟线就计算
+    if (asof - latest["ts"]).total_seconds() > 86400:
+        raise ValueError("不是当天的分钟线")
+
     prior = [r for r in history if str(r.get("date", ""))[:10] < day]
     prior.sort(key=lambda r: str(r.get("date", "")))
     closes = [number(r.get("close")) for r in prior]
@@ -283,13 +286,11 @@ def _worker(task, destination):
 
         kind = task["kind"]
         if kind == "spot":
-            # 使用新浪全市场行情接口，完全避开东方财富
             frame = safe_call(ak.stock_zh_a_spot)
             data = {"rows": records(frame), "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
             day, code = task["day"], task["code"]
-            # 使用腾讯分钟线接口
             frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
                               start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
             minutes = records(frame)
@@ -301,7 +302,6 @@ def _worker(task, destination):
                 if history is None:
                     start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
                     end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
-                    # 使用腾讯历史日线接口
                     frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
                                        start_date=start, end_date=end, adjust="qfq", timeout=12)
                     history = records(frame_hist)
@@ -403,8 +403,7 @@ def report(root, day, picks, status, cfg):
     save_csv(folder / "picks.csv", picks)
     lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
              "生成时间：" + now().isoformat(), "",
-             "运行说明：使用新浪+腾讯接口，不受时间窗口限制；分钟线超过 "
-             + str(cfg["max_minute_age_seconds"]) + " 秒即判定过期。",
+             "运行说明：使用新浪+腾讯接口，随时可运行；盘中获取实时，盘后获取收盘。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
         lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
@@ -486,7 +485,7 @@ def scan_market(cfg=None, root=None):
         status["errors"] += errors
         candidates = apply_learning([r for r in final.values() if r], rules, cfg)
 
-        candidates = [r for r in candidates if (now() - stamp(r["signal_time"])).total_seconds() <= cfg["max_minute_age_seconds"]]
+        # 移除了最终的过期校验，有什么算什么时候的
         picks = [public(r) for r in candidates if r["score"] >= cfg["min_score"]][:cfg["top_n"]]
         status["state"] = "候选已生成" if picks else "复核无可用候选"
         save_json(root / "signals" / (day + ".json"), picks)
@@ -503,7 +502,7 @@ def scan_market(cfg=None, root=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.json")))
-    parser.add_argument("--output", default=str(Path(__file__).with_name("reports")))
+    parser.add_argument("--output", default=str(Path(__file__).resolve().parent / "reports"))
     args = parser.parse_args()
     cfg = dict(DEFAULTS, **load_json(args.config, {}))
     try:
