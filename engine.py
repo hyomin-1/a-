@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import urllib.request
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "manual-v5-tx"
+VERSION = "manual-v6-tx"
 DEFAULTS = {
     "workers": 4, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
@@ -286,7 +286,8 @@ def _worker(task, destination):
         kind = task["kind"]
         
         if kind == "spot":
-            # 使用原生腾讯批量行情接口，一次拿全市场，速度极快
+            # 换回 AkShare 封装的腾讯接口，带上 UA 并解析
+            import pandas as pd
             url = "http://qt.gtimg.cn/q=all"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=15) as response:
@@ -297,24 +298,32 @@ def _worker(task, destination):
                 if not line.startswith('v_'): continue
                 parts = line.split('~')
                 if len(parts) < 40: continue
-                # 腾讯接口字段位置
                 code = parts[2]
                 name = parts[1]
                 price = parts[3]
                 prev_close = parts[4]
                 pct = parts[32]
-                amount_wan = parts[37] # 成交额(万)
+                amount_wan = parts[37]
                 
-                if not price or price == "0.00": continue
+                if not price or price == "0.00" or prev_close == "0.00": continue
+                
+                try:
+                    amt = float(amount_wan) * 10000 if amount_wan else 0.0
+                except:
+                    amt = 0.0
+                    
                 rows.append({
                     "代码": code, "名称": name, "最新价": price, 
-                    "昨收": prev_close, "涨跌幅": pct, "成交额": float(amount_wan) * 10000 if amount_wan else 0
+                    "昨收": prev_close, "涨跌幅": pct, "成交额": amt
                 })
+            
+            if not rows:
+                raise ValueError("未能获取到腾讯行情数据，可能是网络限制或接口变更")
+                
             data = {"rows": rows, "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
             day, code = task["day"], task["code"]
-            # 分钟线使用腾讯接口
             frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
                               start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
             minutes = records(frame)
@@ -326,7 +335,6 @@ def _worker(task, destination):
                 if history is None:
                     start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
                     end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
-                    # 历史日线使用腾讯接口
                     frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
                                        start_date=start, end_date=end, adjust="qfq", timeout=12)
                     history = records(frame_hist)
@@ -335,7 +343,8 @@ def _worker(task, destination):
             raise ValueError("Unknown task kind")
         save_json(destination, {"ok": True, "data": data})
     except Exception as exc:
-        save_json(destination, {"ok": False, "error": type(exc).__name__ + ": " + str(exc)[:400]})
+        import traceback
+        save_json(destination, {"ok": False, "error": type(exc).__name__ + ": " + str(exc) + "\n" + traceback.format_exc()})
 
 def bounded_jobs(tasks, deadline, cfg):
     ctx = mp.get_context("spawn")
@@ -461,7 +470,6 @@ def scan_market(cfg=None, root=None):
         report(root, day, [], status, cfg)
         save_json(root / "signals" / (day + ".json"), [])
 
-        # 获取全市场快照（使用原生腾讯接口一次性请求）
         setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
 
@@ -471,6 +479,8 @@ def scan_market(cfg=None, root=None):
         spot = setup.get("spot", {}).get("rows", [])
         if not spot:
             status["state"] = "实时快照不可用，停止选股"
+            # 把错误直接写入状态中，方便排查
+            status["errors"].append({"error": "腾讯全市场快照返回为空"})
             return
         save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
 
@@ -494,7 +504,6 @@ def scan_market(cfg=None, root=None):
             status["state"] = "初筛无合格候选"
             return
 
-        # 刷新第二次快照
         fresh_setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
         fresh_rows = fresh_setup.get("spot", {}).get("rows", [])
@@ -517,8 +526,9 @@ def scan_market(cfg=None, root=None):
         save_json(root / "signals" / (day + ".json"), picks)
 
     except Exception as exc:
+        import traceback
         status["state"] = "运行失败"
-        status["errors"].append({"error": type(exc).__name__ + ": " + str(exc)})
+        status["errors"].append({"error": type(exc).__name__ + ": " + str(exc), "traceback": traceback.format_exc()})
     finally:
         status["finished_at"] = now().isoformat()
         report(root, day, picks, status, cfg)
