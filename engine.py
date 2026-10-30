@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""随时可运行的筛选与复盘。盘中读实时，盘后读收盘。采用新浪+腾讯接口。"""
+"""随时可运行的筛选与复盘。盘中读实时，盘后读收盘。采用腾讯原生接口。"""
 from __future__ import annotations
 import argparse
 import csv
@@ -14,11 +14,12 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import urllib.request
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "manual-v4-tx"
+VERSION = "manual-v5-tx"
 DEFAULTS = {
-    "workers": 8, "request_timeout_seconds": 40,
+    "workers": 4, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
@@ -283,13 +284,37 @@ def _worker(task, destination):
                     if _ == 2: raise e
 
         kind = task["kind"]
+        
         if kind == "spot":
-            # 采用新浪的行情接口，它支持指定 page 参数，适合海外服务器分页拉取
-            frame = safe_call(ak.stock_zh_a_spot, page=task.get("page", 1))
-            data = {"rows": records(frame), "received_at": now().isoformat()}
+            # 使用原生腾讯批量行情接口，一次拿全市场，速度极快
+            url = "http://qt.gtimg.cn/q=all"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                text = response.read().decode('gbk', errors='ignore')
+            
+            rows = []
+            for line in text.strip().split(';'):
+                if not line.startswith('v_'): continue
+                parts = line.split('~')
+                if len(parts) < 40: continue
+                # 腾讯接口字段位置
+                code = parts[2]
+                name = parts[1]
+                price = parts[3]
+                prev_close = parts[4]
+                pct = parts[32]
+                amount_wan = parts[37] # 成交额(万)
+                
+                if not price or price == "0.00": continue
+                rows.append({
+                    "代码": code, "名称": name, "最新价": price, 
+                    "昨收": prev_close, "涨跌幅": pct, "成交额": float(amount_wan) * 10000 if amount_wan else 0
+                })
+            data = {"rows": rows, "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
             day, code = task["day"], task["code"]
+            # 分钟线使用腾讯接口
             frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
                               start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
             minutes = records(frame)
@@ -301,6 +326,7 @@ def _worker(task, destination):
                 if history is None:
                     start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
                     end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
+                    # 历史日线使用腾讯接口
                     frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
                                        start_date=start, end_date=end, adjust="qfq", timeout=12)
                     history = records(frame_hist)
@@ -402,7 +428,7 @@ def report(root, day, picks, status, cfg):
     save_csv(folder / "picks.csv", picks)
     lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
              "生成时间：" + now().isoformat(), "",
-             "运行说明：使用新浪+腾讯接口，随时可运行；盘中获取实时，盘后获取收盘。",
+             "运行说明：使用腾讯原生接口，随时可运行；盘中获取实时，盘后获取收盘。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
         lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
@@ -435,24 +461,20 @@ def scan_market(cfg=None, root=None):
         report(root, day, [], status, cfg)
         save_json(root / "signals" / (day + ".json"), [])
 
-        # 分页拉取 1 到 80 页的股票数据，每页100条，并发请求避免总时间超时
-        spot_tasks = [{"id": f"spot_{page}", "kind": "spot", "page": page} for page in range(1, 81)]
-        spot_results, errors = bounded_jobs(spot_tasks, now() + timedelta(seconds=180), cfg)
+        # 获取全市场快照（使用原生腾讯接口一次性请求）
+        setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
 
         rules, errors = review_previous(root, day, previous, cfg, now() + timedelta(seconds=180))
         status["errors"] += errors
 
-        all_spot_rows = []
-        for res in spot_results.values():
-            all_spot_rows.extend(res.get("rows", []))
-            
-        if not all_spot_rows:
+        spot = setup.get("spot", {}).get("rows", [])
+        if not spot:
             status["state"] = "实时快照不可用，停止选股"
             return
-        save_json(root / "raw" / (day + "_initial_spot.json"), {"rows": all_spot_rows})
+        save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
 
-        valid = [r for r in all_spot_rows if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
+        valid = [r for r in spot if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
         breadth = sum(number(r["涨跌幅"]) > 0 for r in valid) / max(1, len(valid))
         status["market_breadth"] = breadth
         if breadth < cfg["min_market_breadth"]:
@@ -472,16 +494,14 @@ def scan_market(cfg=None, root=None):
             status["state"] = "初筛无合格候选"
             return
 
-        # 刷新第二次快照，同样采用分页
-        fresh_spot_results, errors = bounded_jobs(spot_tasks, now() + timedelta(seconds=120), cfg)
+        # 刷新第二次快照
+        fresh_setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
-        if not fresh_spot_results:
+        fresh_rows = fresh_setup.get("spot", {}).get("rows", [])
+        if not fresh_rows:
             status["state"] = "刷新失败"
             return
-        fresh_rows = []
-        for res in fresh_spot_results.values():
-            fresh_rows.extend(res.get("rows", []))
-        save_json(root / "raw" / (day + "_final_spot.json"), {"rows": fresh_rows})
+        save_json(root / "raw" / (day + "_final_spot.json"), fresh_setup["spot"])
 
         lookup = {code_of(r.get("代码")): r for r in shortlist(fresh_rows, dict(cfg, shortlist_size=10000))}
         jobs = [{"id": r["code"], "kind": "refresh", "code": r["code"], "day": day,
