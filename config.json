@@ -1,5 +1,5 @@
 {
-  "workers": 4,
+  "workers": 2,
   "request_timeout_seconds": 40,
   "shortlist_size": 60,
   "refresh_size": 8,
@@ -26,6 +26,5 @@
   "min_learning_dates": 10,
   "min_learning_group": 12,
   "max_learning_penalty": 1.0,
-  "apply_learning": true,
-  "calendar_file": "calendar.json"
+  "apply_learning": true
 }
