@@ -1,5 +1,5 @@
 {
-  "workers": 2,
+  "workers": 4,
   "request_timeout_seconds": 300,
   "history_days": 220,
   "shortlist_size": 60,
