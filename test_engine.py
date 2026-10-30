@@ -117,16 +117,21 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertLess(time.monotonic() - start, 4)
 
-    def test_unsupported_calendar_produces_empty_failure_report(self):
-        with tempfile.TemporaryDirectory() as root:
-            with patch.object(e, "now", return_value=e.at("2026-10-29", "14:30:05")):
-                with patch.object(e, "bounded_jobs", return_value=({"calendar": ["2025-12-31"]}, [])):
-                    e.scan_market(e.DEFAULTS, root)
-            path = Path(root) / "daily" / "2026-10-29" / "status.json"
-            status = json.loads(path.read_text())
-            self.assertIn("覆盖不足", status["state"])
-            self.assertEqual(json.loads((Path(root) / "signals" / "2026-10-29.json").read_text()), [])
-            self.assertFalse((Path(root) / "2026-10-29.lock").exists())
+    def test_daily_analyse_works_outside_fixed_1430_window(self):
+        history=[]
+        base=e.at("2026-09-01","00:00:00")
+        for i in range(55):
+            day=(base+timedelta(days=i)).date().isoformat()
+            close=10+i*0.03
+            history.append({"日期":day,"收盘":close,"开盘":close,"最高":close*1.01,
+                            "最低":close*.99,"成交额":200000000,"涨跌幅":0.3,"换手率":3})
+        snapshot={"代码":"600000","名称":"模拟样本","最新价":11.8,"昨收":11.7,
+                  "成交额":300000000,"换手率":4}
+        row=e.daily_analyse(snapshot,history,e.at("2026-10-30","20:00:00").isoformat(),e.DEFAULTS,.6)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["data_mode"],"latest_completed_daily")
+        self.assertTrue(row["signal_time"].endswith("T15:00:00+08:00"))
+
 
     def test_idempotent_previous_friday_review(self):
         cfg = copy.deepcopy(e.DEFAULTS)
