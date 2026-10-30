@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""随时可运行的筛选与复盘。盘中读实时，盘后读收盘。采用腾讯原生接口。"""
+"""随时可运行的筛选与复盘。采用 efinance 接口。"""
 from __future__ import annotations
 import argparse
 import csv
@@ -14,12 +14,11 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import urllib.request
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "manual-v6-tx"
+VERSION = "manual-v7-ef"
 DEFAULTS = {
-    "workers": 4, "request_timeout_seconds": 40,
+    "workers": 2, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
@@ -120,6 +119,7 @@ def feature_tags(row):
     tags = []
     if row["day_pct"] >= 4: tags.append("当日涨幅>=4%")
     if row["deviation_ma10_pct"] >= 4: tags.append("偏离MA10>=4%")
+    if row["turnover_pct"] >= 12: tags.append("换手率>=12%")
     if row["momentum15_pct"] < 0: tags.append("尾盘15分钟走弱")
     if row["above_vwap_pct"] >= 2: tags.append("偏离分时均价>=2%")
     if row["breadth"] < 0.45: tags.append("市场上涨占比<45%")
@@ -164,11 +164,14 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     ma5 = statistics.mean((closes + [price])[-5:])
     above = (price / vwap - 1) * 100
     deviation = (price / ma10 - 1) * 100
+    turnover = number(snapshot.get("换手率"))
+    if turnover is None:
+        raise ValueError("缺少换手率")
     
     if not (cfg["min_price"] <= price <= cfg["max_price"]): return None
     if not (cfg["min_day_pct"] <= day_pct <= cfg["max_day_pct"]): return None
     if amount < cfg["min_amount_yuan"] or pullback > cfg["max_pullback_pct"]: return None
-    if not (-0.2 <= above <= 3 and -0.4 <= momentum <= 2.5): return None
+    if not (-0.2 <= above <= 3 and -0.4 <= momentum <= 2.5 and 0.5 <= turnover <= 20): return None
     
     score, reasons = 0.0, []
     if 0 <= above <= 1.5: score += 2; reasons.append("价格贴近且高于分时均价")
@@ -180,6 +183,7 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     if price >= ma5: score += 1
     if 0 <= day_pct <= 4: score += 1
     if amount >= cfg["min_amount_yuan"] * 2: score += 1
+    if 2 <= turnover <= 12: score += 1
     
     row = {
         "signal_date": day, "code": code_of(snapshot["代码"]), "name": snapshot["名称"],
@@ -188,7 +192,7 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
         "entry_proxy_price": round(price * (1 + cfg["entry_slippage_pct"] / 100), 6),
         "score_raw": round(score, 3), "score": round(score, 3),
         "day_pct": day_pct, "momentum15_pct": momentum, "pullback_pct": pullback,
-        "above_vwap_pct": above, "deviation_ma10_pct": deviation,
+        "above_vwap_pct": above, "deviation_ma10_pct": deviation, "turnover_pct": turnover,
         "amount_yuan": amount, "breadth": breadth,
         "reasons": reasons, "strategy_id": config_id(cfg), "learning_penalty": 0.0,
         "valid_until": at(day, "23:59:59").isoformat(), "_history": prior,
@@ -268,76 +272,48 @@ def apply_learning(rows, rules, cfg):
 
 def _worker(task, destination):
     try:
-        import akshare as ak
+        import efinance as ef
+        import pandas as pd
         
-        def records(frame):
-            if frame is None or frame.empty:
+        def records(df):
+            if df is None or df.empty:
                 return []
-            return json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False))
-            
-        def safe_call(func, **kwargs):
-            for _ in range(3):
-                try:
-                    return func(**kwargs)
-                except Exception as e:
-                    time.sleep(2)
-                    if _ == 2: raise e
+            # efinance 返回的列名是中文，直接转字典
+            return df.to_dict(orient="records")
 
         kind = task["kind"]
         
         if kind == "spot":
-            # 换回 AkShare 封装的腾讯接口，带上 UA 并解析
-            import pandas as pd
-            url = "http://qt.gtimg.cn/q=all"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                text = response.read().decode('gbk', errors='ignore')
-            
-            rows = []
-            for line in text.strip().split(';'):
-                if not line.startswith('v_'): continue
-                parts = line.split('~')
-                if len(parts) < 40: continue
-                code = parts[2]
-                name = parts[1]
-                price = parts[3]
-                prev_close = parts[4]
-                pct = parts[32]
-                amount_wan = parts[37]
-                
-                if not price or price == "0.00" or prev_close == "0.00": continue
-                
-                try:
-                    amt = float(amount_wan) * 10000 if amount_wan else 0.0
-                except:
-                    amt = 0.0
-                    
-                rows.append({
-                    "代码": code, "名称": name, "最新价": price, 
-                    "昨收": prev_close, "涨跌幅": pct, "成交额": amt
-                })
-            
-            if not rows:
-                raise ValueError("未能获取到腾讯行情数据，可能是网络限制或接口变更")
-                
-            data = {"rows": rows, "received_at": now().isoformat()}
+            # 获取全市场快照 (efinance 有内置的重试和伪装)
+            df = ef.stock.get_realtime_quotes()
+            if df is None or df.empty:
+                raise ValueError("未能获取到 efinance 实时行情")
+            data = {"rows": records(df), "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
             day, code = task["day"], task["code"]
-            frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
-                              start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
-            minutes = records(frame)
             
+            # efinance 分钟线
+            df_min = ef.stock.get_quote_history(code, klt=1, fqt=0)
+            if df_min is not None and not df_min.empty:
+                df_min["时间"] = df_min["日期"]
+                minutes = records(df_min)
+            else:
+                minutes = []
+                
             if kind == "minutes":
                 data = minutes
             else:
                 history = task.get("history")
                 if history is None:
-                    start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
-                    end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
-                    frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
-                                       start_date=start, end_date=end, adjust="qfq", timeout=12)
-                    history = records(frame_hist)
+                    # 日线
+                    df_hist = ef.stock.get_quote_history(code, klt=101, fqt=1)
+                    if df_hist is not None and not df_hist.empty:
+                        df_hist["date"] = df_hist["日期"]
+                        df_hist["close"] = df_hist["收盘"]
+                        history = records(df_hist)
+                    else:
+                        history = []
                 data = analyse(task["snapshot"], minutes, history, now(), task["cfg"], task["breadth"])
         else:
             raise ValueError("Unknown task kind")
@@ -437,7 +413,7 @@ def report(root, day, picks, status, cfg):
     save_csv(folder / "picks.csv", picks)
     lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
              "生成时间：" + now().isoformat(), "",
-             "运行说明：使用腾讯原生接口，随时可运行；盘中获取实时，盘后获取收盘。",
+             "运行说明：使用 efinance 接口，随时可运行；盘中获取实时，盘后获取收盘。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
         lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
@@ -479,8 +455,7 @@ def scan_market(cfg=None, root=None):
         spot = setup.get("spot", {}).get("rows", [])
         if not spot:
             status["state"] = "实时快照不可用，停止选股"
-            # 把错误直接写入状态中，方便排查
-            status["errors"].append({"error": "腾讯全市场快照返回为空"})
+            status["errors"].append({"error": "efinance 返回空"})
             return
         save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
 
