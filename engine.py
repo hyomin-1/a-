@@ -16,13 +16,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "manual-v3-tx"
+VERSION = "manual-v4-tx"
 DEFAULTS = {
-    "workers": 4, "request_timeout_seconds": 40,
+    "workers": 8, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
-    # 删除了 max_minute_age_seconds，不再限制数据新鲜度
     "min_minute_bars": 180,
     "allow_chinext": False, "min_market_breadth": 0.35,
     "target_net_pct": 0.0, "stop_net_pct": -1.5, "exit_time": "10:30:00",
@@ -133,7 +132,6 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
         raise ValueError("当日有效分钟线不足")
     latest = bars[-1]
     
-    # 移除了行情过期判断，只要拿到当天分钟线就计算
     if (asof - latest["ts"]).total_seconds() > 86400:
         raise ValueError("不是当天的分钟线")
 
@@ -286,7 +284,8 @@ def _worker(task, destination):
 
         kind = task["kind"]
         if kind == "spot":
-            frame = safe_call(ak.stock_zh_a_spot)
+            # 采用新浪的行情接口，它支持指定 page 参数，适合海外服务器分页拉取
+            frame = safe_call(ak.stock_zh_a_spot, page=task.get("page", 1))
             data = {"rows": records(frame), "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
@@ -436,26 +435,31 @@ def scan_market(cfg=None, root=None):
         report(root, day, [], status, cfg)
         save_json(root / "signals" / (day + ".json"), [])
 
-        setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=120), cfg)
+        # 分页拉取 1 到 80 页的股票数据，每页100条，并发请求避免总时间超时
+        spot_tasks = [{"id": f"spot_{page}", "kind": "spot", "page": page} for page in range(1, 81)]
+        spot_results, errors = bounded_jobs(spot_tasks, now() + timedelta(seconds=180), cfg)
         status["errors"] += errors
 
         rules, errors = review_previous(root, day, previous, cfg, now() + timedelta(seconds=180))
         status["errors"] += errors
 
-        spot = setup.get("spot", {}).get("rows", [])
-        if not spot:
+        all_spot_rows = []
+        for res in spot_results.values():
+            all_spot_rows.extend(res.get("rows", []))
+            
+        if not all_spot_rows:
             status["state"] = "实时快照不可用，停止选股"
             return
-        save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
+        save_json(root / "raw" / (day + "_initial_spot.json"), {"rows": all_spot_rows})
 
-        valid = [r for r in spot if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
+        valid = [r for r in all_spot_rows if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
         breadth = sum(number(r["涨跌幅"]) > 0 for r in valid) / max(1, len(valid))
         status["market_breadth"] = breadth
         if breadth < cfg["min_market_breadth"]:
             status["state"] = "上涨占比低于阈值"
             return
 
-        rows = shortlist(spot, cfg)
+        rows = shortlist(valid, cfg)
         status["shortlisted"] = len(rows)
 
         jobs = [{"id": r["代码"], "kind": "analyse", "code": r["代码"], "day": day,
@@ -468,15 +472,18 @@ def scan_market(cfg=None, root=None):
             status["state"] = "初筛无合格候选"
             return
 
-        fresh, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
+        # 刷新第二次快照，同样采用分页
+        fresh_spot_results, errors = bounded_jobs(spot_tasks, now() + timedelta(seconds=120), cfg)
         status["errors"] += errors
-        if "spot" not in fresh:
+        if not fresh_spot_results:
             status["state"] = "刷新失败"
             return
-        save_json(root / "raw" / (day + "_final_spot.json"), fresh["spot"])
+        fresh_rows = []
+        for res in fresh_spot_results.values():
+            fresh_rows.extend(res.get("rows", []))
+        save_json(root / "raw" / (day + "_final_spot.json"), {"rows": fresh_rows})
 
-        refresh_rows = fresh["spot"]["rows"]
-        lookup = {code_of(r.get("代码")): r for r in shortlist(refresh_rows, dict(cfg, shortlist_size=10000))}
+        lookup = {code_of(r.get("代码")): r for r in shortlist(fresh_rows, dict(cfg, shortlist_size=10000))}
         jobs = [{"id": r["code"], "kind": "refresh", "code": r["code"], "day": day,
                  "snapshot": lookup[r["code"]], "history": r["_history"], "cfg": cfg, "breadth": breadth}
                 for r in candidates[:cfg["refresh_size"]] if r["code"] in lookup]
@@ -485,7 +492,6 @@ def scan_market(cfg=None, root=None):
         status["errors"] += errors
         candidates = apply_learning([r for r in final.values() if r], rules, cfg)
 
-        # 移除了最终的过期校验，有什么算什么时候的
         picks = [public(r) for r in candidates if r["score"] >= cfg["min_score"]][:cfg["top_n"]]
         status["state"] = "候选已生成" if picks else "复核无可用候选"
         save_json(root / "signals" / (day + ".json"), picks)
