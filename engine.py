@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""随时可运行，稳健抓取新浪数据，不强行报错。"""
+"""随时可运行，无限等待网络响应版。"""
 from __future__ import annotations
 import argparse
 import csv
@@ -16,14 +16,15 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "steady-v1"
+VERSION = "infinite-wait-v1"
 DEFAULTS = {
-    "workers": 4, "request_timeout_seconds": 35,
+    # 把并发降低，把超时时间拉长到 300 秒（5分钟）
+    "workers": 2, "request_timeout_seconds": 300,
     "history_days": 220, "intraday_max_age_seconds": 300,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 4.0,
     "min_amount_yuan": 50000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -2, "max_day_pct": 8.0, "max_pullback_pct": 5.0,
-    "max_minute_age_seconds": 300, "min_minute_bars": 10,
+    "max_minute_age_seconds": 86400, "min_minute_bars": 10, # 放宽过期检查
     "allow_chinext": True, "min_market_breadth": 0.1,
     "target_net_pct": 0.0, "stop_net_pct": -1.5, "exit_time": "10:30:00",
     "round_trip_cost_pct": 0.20, "entry_slippage_pct": 0.05,
@@ -121,7 +122,6 @@ def feature_tags(row):
     tags = []
     if row["day_pct"] >= 4: tags.append("当日涨幅>=4%")
     if row["deviation_ma10_pct"] >= 4: tags.append("偏离MA10>=4%")
-    if row["turnover_pct"] >= 12: tags.append("换手率>=12%")
     if row["momentum15_pct"] < 0: tags.append("尾盘15分钟走弱")
     if row["above_vwap_pct"] >= 2: tags.append("偏离分时均价>=2%")
     if row["breadth"] < 0.45: tags.append("市场上涨占比<45%")
@@ -274,27 +274,23 @@ def _worker(task, destination):
                 return []
             return json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False))
             
-        def safe_call(func, **kwargs):
-            for _ in range(3):
-                try:
-                    return func(**kwargs)
-                except Exception as e:
-                    time.sleep(2)
-                    if _ == 2: raise e
+        # 纯粹的单次调用，没有次数限制，只要不死就一直等着
+        def slow_call(func, **kwargs):
+            return func(**kwargs)
 
         kind = task["kind"]
         
         if kind == "spot":
-            # 强制使用新浪接口，如果超时给足 10 秒
-            frame = safe_call(ak.stock_zh_a_spot)
+            # 新浪全市场
+            frame = slow_call(ak.stock_zh_a_spot)
             if frame is None or frame.empty:
-                raise ValueError("未能获取到新浪数据")
+                raise ValueError("新浪接口返回空，可能是因为非交易时间服务器无响应")
             data = {"rows": records(frame), "received_at": now().isoformat()}
             
         elif kind in ("analyse", "refresh", "minutes"):
             day, code = task["day"], task["code"]
             # 腾讯分钟线
-            frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
+            frame = slow_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
                               start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
             minutes = records(frame)
             
@@ -306,7 +302,7 @@ def _worker(task, destination):
                     start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
                     end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
                     # 腾讯日线
-                    frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
+                    frame_hist = slow_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
                                        start_date=start, end_date=end, adjust="qfq", timeout=12)
                     history = records(frame_hist)
                 data = analyse(task["snapshot"], minutes, history, now(), task["cfg"], task["breadth"])
@@ -330,6 +326,7 @@ def bounded_jobs(tasks, deadline, cfg):
                     process.start()
                     running[index] = (process, time.monotonic(), task, path)
                 for index, (process, started, task, path) in list(running.items()):
+                    # 注意这里：超时时间由 config.json 里的 request_timeout_seconds 决定（默认改成了300）
                     expired = time.monotonic() - started >= cfg["request_timeout_seconds"]
                     if process.is_alive() and not expired: continue
                     if process.is_alive(): process.terminate()
@@ -407,7 +404,7 @@ def report(root, day, picks, status, cfg):
     save_csv(folder / "picks.csv", picks)
     lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
              "生成时间：" + now().isoformat(), "",
-             "运行说明：使用新浪+腾讯接口，随时可运行；盘中获取实时，盘后获取收盘。",
+             "运行说明：使用新浪+腾讯接口，随时可运行。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
         lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
@@ -440,7 +437,8 @@ def scan_market(cfg=None, root=None):
         report(root, day, [], status, cfg)
         save_json(root / "signals" / (day + ".json"), [])
 
-        setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
+        # 拉取快照给足 120 秒
+        setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=120), cfg)
         status["errors"] += errors
 
         rules, errors = review_previous(root, day, previous, cfg, now() + timedelta(seconds=180))
@@ -449,7 +447,7 @@ def scan_market(cfg=None, root=None):
         spot = setup.get("spot", {}).get("rows", [])
         if not spot:
             status["state"] = "实时快照不可用，停止选股"
-            status["errors"].append({"error": "新浪行情返回空"})
+            status["errors"].append({"error": "新浪行情返回空，可能服务器屏蔽了海外IP或当前非交易日"})
             return
         save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
 
@@ -463,6 +461,7 @@ def scan_market(cfg=None, root=None):
         rows = shortlist(valid, cfg)
         status["shortlisted"] = len(rows)
 
+        # 单股分析给足 300 秒
         jobs = [{"id": r["代码"], "kind": "analyse", "code": r["代码"], "day": day,
                  "snapshot": r, "cfg": cfg, "breadth": breadth} for r in rows]
         initial, errors = bounded_jobs(jobs, now() + timedelta(seconds=300), cfg)
@@ -473,7 +472,8 @@ def scan_market(cfg=None, root=None):
             status["state"] = "初筛无合格候选"
             return
 
-        fresh_setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
+        # 刷新给足 120 秒
+        fresh_setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=120), cfg)
         status["errors"] += errors
         fresh_rows = fresh_setup.get("spot", {}).get("rows", [])
         if not fresh_rows:
@@ -486,7 +486,8 @@ def scan_market(cfg=None, root=None):
                  "snapshot": lookup[r["code"]], "history": r["_history"], "cfg": cfg, "breadth": breadth}
                 for r in candidates[:cfg["refresh_size"]] if r["code"] in lookup]
 
-        final, errors = bounded_jobs(jobs, now() + timedelta(seconds=180), dict(cfg, request_timeout_seconds=20))
+        # 最终复核给足 300 秒
+        final, errors = bounded_jobs(jobs, now() + timedelta(seconds=300), dict(cfg, request_timeout_seconds=300))
         status["errors"] += errors
         candidates = apply_learning([r for r in final.values() if r], rules, cfg)
 
