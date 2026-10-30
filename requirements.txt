@@ -1,4 +1,2 @@
-akshare
-pandas
-numpy
-akshare-proxy-patch
+efinance>=0.5.2
+pandas>=2,<3
