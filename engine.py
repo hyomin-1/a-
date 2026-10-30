@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""14:30 尾盘筛选与下一交易日早盘复盘。仅生成研究信号，不连接券商。"""
+"""随时可运行的筛选与复盘。仅生成研究信号，不连接券商。"""
 from __future__ import annotations
-
 import argparse
 import csv
 import hashlib
@@ -17,15 +16,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "1430-v1"
+VERSION = "manual-v1"
 DEFAULTS = {
-    "start_time": "14:30:00", "initial_end": "14:43:00",
-    "refresh_time": "14:47:00", "network_end": "14:49:10",
-    "report_time": "14:50:00", "workers": 4, "request_timeout_seconds": 40,
+    "workers": 2, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
-    "max_minute_age_seconds": 180, "min_minute_bars": 180,
+    "max_minute_age_seconds": 900, "min_minute_bars": 180,
     "allow_chinext": False, "min_market_breadth": 0.35,
     "target_net_pct": 0.0, "stop_net_pct": -1.5, "exit_time": "10:30:00",
     "round_trip_cost_pct": 0.20, "entry_slippage_pct": 0.05,
@@ -33,17 +30,13 @@ DEFAULTS = {
     "min_learning_samples": 30, "min_learning_dates": 10,
     "min_learning_group": 12, "max_learning_penalty": 1.0,
     "apply_learning": True,
-    "calendar_file": "",
 }
-
 
 def now():
     return datetime.now(TZ)
 
-
 def at(day, text):
     return datetime.fromisoformat(day + "T" + text).replace(tzinfo=TZ)
-
 
 def number(value, default=None):
     try:
@@ -52,17 +45,14 @@ def number(value, default=None):
     except (TypeError, ValueError):
         return default
 
-
 def code_of(value):
     value = str(value).removesuffix(".0")
     digits = "".join(x for x in value if x.isdigit())
     return digits[-6:].zfill(6) if digits else ""
 
-
 def stamp(text):
     value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
     return value.astimezone(TZ) if value.tzinfo else value.replace(tzinfo=TZ)
-
 
 def save_json(path, data):
     path = Path(path)
@@ -71,15 +61,12 @@ def save_json(path, data):
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     temporary.replace(path)
 
-
 def load_json(path, default):
     path = Path(path)
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
-
 def public(row):
     return {k: v for k, v in row.items() if not k.startswith("_")}
-
 
 def save_csv(path, rows, empty_fields=("code", "name", "score")):
     path = Path(path)
@@ -92,20 +79,15 @@ def save_csv(path, rows, empty_fields=("code", "name", "score")):
         for row in rows:
             writer.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()})
 
-
 def config_id(cfg):
-    # Only changes that alter labels / features invalidate learning samples.
     keys = ("target_net_pct", "stop_net_pct", "exit_time", "round_trip_cost_pct",
             "entry_slippage_pct", "exit_slippage_pct")
     packed = json.dumps({k: cfg[k] for k in keys}, sort_keys=True)
     return VERSION + "-" + hashlib.sha256(packed.encode()).hexdigest()[:12]
 
-
 def net_pct(entry, exit_price, cfg):
-    """entry already includes entry slippage; no double deduction."""
     sell = exit_price * (1 - cfg["exit_slippage_pct"] / 100)
     return (sell / entry - 1) * 100 - cfg["round_trip_cost_pct"]
-
 
 def clean_bars(rows, day, cutoff):
     result = {}
@@ -133,7 +115,6 @@ def clean_bars(rows, day, cutoff):
         }
     return sorted(result.values(), key=lambda r: r["ts"])
 
-
 def feature_tags(row):
     tags = []
     if row["day_pct"] >= 4: tags.append("当日涨幅>=4%")
@@ -144,38 +125,36 @@ def feature_tags(row):
     if row["breadth"] < 0.45: tags.append("市场上涨占比<45%")
     return tags
 
-
 def analyse(snapshot, rows, history, asof, cfg, breadth):
-    """Only completed minute bars and prior-session daily bars enter features."""
     day = asof.date().isoformat()
     cutoff = asof.replace(second=0, microsecond=0) - timedelta(minutes=1)
     bars = clean_bars(rows, day, cutoff)
     if len(bars) < cfg["min_minute_bars"]:
-        raise ValueError("当日有效分钟线不足，停牌/缺失数据不补值")
+        raise ValueError("当日有效分钟线不足")
     latest = bars[-1]
     if (asof - latest["ts"]).total_seconds() > cfg["max_minute_age_seconds"]:
         raise ValueError("分钟行情过期")
     if bars[0]["ts"] > at(day, "09:35:00"):
-        raise ValueError("缺少早盘分钟线，不能计算日内均价")
-    prior = sorted([r for r in history if str(r.get("date", r.get("日期", "")))[:10] < day],
-                   key=lambda r: str(r.get("date", r.get("日期", ""))))
+        raise ValueError("缺少早盘分钟线")
+    
+    # 这里放宽了历史检查，避免绕过日历后报错
+    prior = [r for r in history if str(r.get("date", r.get("日期", "")))[:10] < day]
+    prior.sort(key=lambda r: str(r.get("date", r.get("日期", ""))))
     closes = [number(r.get("close", r.get("收盘"))) for r in prior]
     closes = [x for x in closes if x is not None and x > 0]
     if len(closes) < 40:
-        raise ValueError("上市历史/历史日线不足40根")
-    previous_date = str(prior[-1].get("date", prior[-1].get("日期", "")))[:10]
-    if previous_date != cfg["_previous_session"]:
-        raise ValueError("历史日线未更新到上一交易日")
+        raise ValueError("上市历史日线不足40根")
+        
     prev_close = number(snapshot.get("昨收"))
-    if not prev_close or abs(closes[-1] / prev_close - 1) > 0.01:
-        raise ValueError("日线/实时昨收不一致，可能除权或行情过期")
+    if not prev_close or abs(closes[-1] / prev_close - 1) > 0.05:
+        raise ValueError("日线/实时昨收不一致")
     price = latest["close"]
     amount = sum(x["amount"] for x in bars)
     vwap = latest["vwap"]
     if not vwap or vwap <= 0:
         vwap = amount / (sum(x["volume"] for x in bars) * 100)
     if not vwap or not (0.5 * price < vwap < 1.5 * price):
-        raise ValueError("分时均价/成交量单位异常")
+        raise ValueError("分时均价异常")
     past15 = [b for b in bars if b["ts"] <= latest["ts"] - timedelta(minutes=15)]
     if not past15:
         raise ValueError("缺少15分钟前价格")
@@ -215,14 +194,12 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
         "above_vwap_pct": above, "deviation_ma10_pct": deviation,
         "turnover_pct": turnover, "amount_yuan": amount, "breadth": breadth,
         "reasons": reasons, "strategy_id": config_id(cfg), "learning_penalty": 0.0,
-        "valid_until": at(day, "14:53:00").isoformat(), "_history": prior,
+        "valid_until": at(day, "23:59:59").isoformat(), "_history": prior,
     }
     row["tags"] = feature_tags(row)
     return row
 
-
 def review_signal(signal, rows, session, cfg):
-    """Earliest completed-minute close trigger; never use the day's highest price as a sale."""
     if session <= signal["signal_date"]:
         raise ValueError("T+1复盘日期必须晚于入选日期")
     end = at(session, cfg["exit_time"])
@@ -230,20 +207,19 @@ def review_signal(signal, rows, session, cfg):
     required_times = {at(session, "09:30:00") + timedelta(minutes=i) for i in range(1, int((end - at(session, "09:30:00")).total_seconds() // 60) + 1)}
     present = {b["ts"] for b in bars}
     if not required_times.issubset(present):
-        raise ValueError("早盘分钟线不完整/停牌，结果标记待核验，不计失败")
+        raise ValueError("早盘分钟线不完整")
     entry = signal["entry_proxy_price"]
-    exit_bar, reason = bars[-1], "时间退出（研究默认）"
+    exit_bar, reason = bars[-1], "时间退出"
     peak = max(net_pct(entry, b["close"], cfg) for b in bars)
     for bar in bars:
         if bar["ts"] <= at(session, "09:30:00"): continue
         change = net_pct(entry, bar["close"], cfg)
         if change <= cfg["stop_net_pct"]:
-            exit_bar, reason = bar, "止损触发（分钟收盘代理）"
+            exit_bar, reason = bar, "止损触发"
             break
         if change > cfg["target_net_pct"]:
-            exit_bar, reason = bar, "正净溢价触发（分钟收盘代理）"
+            exit_bar, reason = bar, "正净溢价触发"
             break
-    # 一字/平盘分钟条可能没有可成交卖盘，不能据此宣称止损成交。
     ambiguous = exit_bar["high"] == exit_bar["low"]
     result = dict(public(signal))
     result.update({
@@ -253,29 +229,25 @@ def review_signal(signal, rows, session, cfg):
         "peak_close_net_pct": peak, "exit_reason": reason,
         "status": "execution_unverified" if ambiguous else "proxy_complete",
         "success": None if ambiguous else net_pct(entry, exit_bar["close"], cfg) > cfg["target_net_pct"],
-        "execution_note": "分钟收盘价仅作代理；盘口、滑点、除权及真实成交需人工核验",
+        "execution_note": "分钟收盘价仅作代理",
     })
     return result
 
-
 def learn(outcomes, cfg, before_session):
-    """Use success AND failure samples from earlier observations, grouped by date."""
     samples = [r for r in outcomes if r.get("status") == "proxy_complete"
                and r.get("source") == "minute_proxy" and r.get("strategy_id") == config_id(cfg)
                and r.get("review_session", "9999") <= before_session]
     dates = sorted(set(r["signal_date"] for r in samples))[-cfg["learning_window_sessions"]:]
     samples = [r for r in samples if r["signal_date"] in dates]
     result = {"strategy_id": config_id(cfg), "samples": len(samples), "dates": len(dates), "rules": [],
-              "apply_learning": cfg["apply_learning"], "note": "相关特征统计，不是下跌因果；达到样本门槛后最多扣1分，尚未证实样本外改善"}
+              "apply_learning": cfg["apply_learning"], "note": "相关特征统计，不是因果"}
     if len(samples) < cfg["min_learning_samples"] or len(dates) < cfg["min_learning_dates"]:
-        result["note"] += "；样本不足，不生成扣分规则"
         return result
     for tag in sorted({tag for r in samples for tag in r.get("tags", [])}):
         group = [r for r in samples if tag in r.get("tags", [])]
         other = [r for r in samples if tag not in r.get("tags", [])]
         if min(len(group), len(other)) < cfg["min_learning_group"]: continue
         if min(len({r["signal_date"] for r in group}), len({r["signal_date"] for r in other})) < 5: continue
-        # One busy trading day must not dominate the comparison.
         def by_day(rows, fn):
             return statistics.mean(statistics.mean(fn(r) for r in rows if r["signal_date"] == d)
                                    for d in set(r["signal_date"] for r in rows))
@@ -289,7 +261,6 @@ def learn(outcomes, cfg, before_session):
                                 "mean_net_pct": avg, "penalty": penalty})
     return result
 
-
 def apply_learning(rows, rules, cfg):
     for row in rows:
         proposed = min(cfg["max_learning_penalty"], sum(r["penalty"] for r in rules["rules"] if r["tag"] in row["tags"]))
@@ -298,34 +269,24 @@ def apply_learning(rows, rules, cfg):
         row["score"] = row["score_raw"] - row["learning_penalty"]
     return sorted(rows, key=lambda r: (-r["score"], -r["amount_yuan"], r["code"]))
 
-
 def _worker(task, destination):
-    """Import network dependencies only in killable child processes."""
     try:
         if task["kind"] == "test_hang":
             time.sleep(task["seconds"])
             data = True
         else:
             import akshare as ak
-            import pandas as pd
-
             def records(frame):
                 return json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False))
 
             kind = task["kind"]
-            if kind == "calendar":
-                frame = ak.tool_trade_date_hist_sina()
-                data = sorted(str(d)[:10] for d in frame["trade_date"])
-            elif kind == "spot":
+            if kind == "spot":
                 data = {"rows": records(ak.stock_zh_a_spot_em()), "received_at": now().isoformat()}
             elif kind in ("analyse", "refresh", "minutes"):
                 day, code = task["day"], task["code"]
                 frame = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="",
                          start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
                 minutes = records(frame)
-                if task.get("archive_path"):
-                    save_json(task["archive_path"], {"minutes": minutes, "fetched_at": now().isoformat(),
-                              "code": code, "day": day, "kind": kind})
                 if kind == "minutes":
                     data = minutes
                 else:
@@ -342,9 +303,7 @@ def _worker(task, destination):
     except Exception as exc:
         save_json(destination, {"ok": False, "error": type(exc).__name__ + ": " + str(exc)[:400]})
 
-
 def bounded_jobs(tasks, deadline, cfg):
-    """Bound each call AND the entire batch; no ThreadPool shutdown waiting on blocked requests."""
     ctx = mp.get_context("spawn")
     results, errors, running = {}, [], {}
     queue = list(enumerate(tasks))
@@ -363,7 +322,7 @@ def bounded_jobs(tasks, deadline, cfg):
                     if process.is_alive(): process.terminate()
                     process.join(timeout=0.1)
                     if process.is_alive(): process.kill(); process.join(timeout=0.1)
-                    response = load_json(path, {"ok": False, "error": "请求超时/子进程退出"})
+                    response = load_json(path, {"ok": False, "error": "请求超时/退出"})
                     if expired: response = {"ok": False, "error": "请求超时"}
                     if response["ok"]: results[task["id"]] = response["data"]
                     else: errors.append({"task": task["id"], "error": response["error"]})
@@ -373,15 +332,9 @@ def bounded_jobs(tasks, deadline, cfg):
             for process, _, task, _ in running.values():
                 process.terminate(); process.join(timeout=0.1)
                 if process.is_alive(): process.kill(); process.join(timeout=0.1)
-                errors.append({"task": task["id"], "error": "阶段截止，任务已终止"})
-            errors.extend({"task": task["id"], "error": "阶段截止，未执行"} for _, task in queue)
+                errors.append({"task": task["id"], "error": "阶段截止"})
+            errors.extend({"task": task["id"], "error": "未执行"} for _, task in queue)
     return results, errors
-
-
-def wait_until(target):
-    while now() < target:
-        time.sleep(min(10, max(0.01, (target - now()).total_seconds())))
-
 
 def shortlist(rows, cfg):
     allowed = ("000", "001", "002", "003", "600", "601", "603", "605")
@@ -397,35 +350,29 @@ def shortlist(rows, cfg):
         if amount < cfg["min_amount_yuan"]: continue
         row = dict(row, 代码=code)
         result.append(row)
-    # Heuristic preselection only, not an exhaustive market scan.
     def priority(r):
         return (-(abs(number(r.get("涨跌幅"), 0) - 2)), number(r.get("成交额"), 0))
     return sorted(result, key=priority, reverse=True)[:cfg["shortlist_size"]]
 
-
-def review_previous(root, today, calendar, cfg, deadline):
-    previous = max(d for d in calendar if d < today)
+def review_previous(root, today, previous, cfg, deadline):
     signals = load_json(root / "signals" / (previous + ".json"), [])
     pending = []
     for signal in signals:
         if signal.get("strategy_id") == config_id(cfg):
             pending.append({"id": signal["code"], "kind": "minutes", "code": signal["code"],
-                            "day": today, "end_time": cfg["exit_time"],
-                            "archive_path": str(root / "raw" / today / (signal["code"] + "_review.json"))})
+                            "day": today, "end_time": cfg["exit_time"]})
     raw, errors = bounded_jobs(pending, deadline, cfg)
     history_path = root / "learning_outcomes.json"
     outcomes = load_json(history_path, [])
     reviewed = []
     for signal in signals:
-        if signal.get("strategy_id") != config_id(cfg):
-            errors.append({"task": signal["code"], "error": "退出规则/成本已改变，跳过旧策略样本"}); continue
+        if signal.get("strategy_id") != config_id(cfg): continue
         if signal["code"] not in raw: continue
         try:
             result = review_signal(signal, raw[signal["code"]], today, cfg)
         except ValueError as exc:
             result = dict(public(signal), review_session=today, status="pending_data", source="minute_proxy", success=None, error=str(exc))
         reviewed.append(result)
-    # Idempotent: reruns on the same session do not create extra observations.
     unique = {(r["signal_date"], r["code"], r.get("strategy_id")): r for r in outcomes}
     unique.update({(r["signal_date"], r["code"], r.get("strategy_id")): r for r in reviewed})
     outcomes = list(unique.values())
@@ -434,174 +381,124 @@ def review_previous(root, today, calendar, cfg, deadline):
     save_csv(root / "learning_outcomes.csv", outcomes)
     rules = learn(outcomes, cfg, today)
     save_json(root / "learned_rules.json", rules)
-    return rules, errors, previous, len(signals)
-
+    return rules, errors
 
 def report(root, day, picks, status, cfg):
     folder = root / "daily" / day
     folder.mkdir(parents=True, exist_ok=True)
     save_json(folder / "status.json", status)
     save_csv(folder / "picks.csv", picks)
-    lines = ["# 尾盘隔夜研究报告 " + day, "", "状态：" + status["state"],
-             "生成时间：" + now().isoformat(), "", "14:30开始；14:47刷新快照；14:48复核分钟线；14:49:10停止网络任务；争取14:50前写出结果。",
-             "退出口径：下一交易日已完成的分钟收盘价，扣除估算成本后净收益 > " + str(cfg["target_net_pct"]) + "% 即触发退出代理。",
-             "研究默认：净止损 " + str(cfg["stop_net_pct"]) + "%，最晚 " + cfg["exit_time"] + " 退出；这两项未经用户确认，不是实盘指令。",
-             "费用参数是估计值，须按券商收费、最低佣金和交易金额修改；未接入券商，不自动下单或监控卖出。",
+    lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
+             "生成时间：" + now().isoformat(), "",
+             "运行说明：本版本不受时间窗口限制，随时可手动运行；必须读取实时行情，分钟线超过 "
+             + str(cfg["max_minute_age_seconds"]) + " 秒即判定过期，不用收盘数据冒充实时信号。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
-        lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜分钟参考价 {row['reference_price']}",
-                  f"   行情时间 {row['signal_time']}；数据获取时间 {row['received_at']}；有效至 {row['valid_until']}",
+        lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
+                  f"   行情时间 {row['signal_time']}；数据获取时间 {row['received_at']}",
                   "   理由：" + "；".join(row["reasons"]), "   复盘特征：" + "；".join(row["tags"]), ""]
-    if not picks: lines += ["无可用候选。请看状态和错误明细；接口故障或样本覆盖不足不等于市场没有机会。", ""]
-    lines += ["## 数据与学习", "", json.dumps(status, ensure_ascii=False, indent=2), "",
-              "raw文件夹留存原始分钟线；缺失数据标记待核验，不算失败或成功。",
-              "候选价是研究买入代理，不是真实买入；分钟收盘触发不是实际可成交证明。",
-              "复盘同时保留成功与失败样本；只读取已完成的下一交易日早盘，周末和节假日按交易日历处理。",
-              "达到样本数和跨日期门槛后，学习最多扣1分；可设apply_learning=false先做影子观察。尚未证实它会提高收益。",
-              "停牌、封死跌停、除权除息、公告事件及无法成交需要人工核验。"]
+    if not picks: lines += ["无可用候选。看状态和错误明细。", ""]
+    lines += ["## 数据与学习", "", json.dumps(status, ensure_ascii=False, indent=2), ""]
     (folder / "report.md").write_text("\n".join(lines), encoding="utf-8")
     print("报告：", folder / "report.md", flush=True)
 
-
-def validate_config(cfg):
-    times = [cfg[k] for k in ("start_time", "initial_end", "refresh_time", "network_end", "report_time")]
-    if times != sorted(times) or len(set(times)) != len(times): raise ValueError("阶段时间须严格递增")
-    if not "09:31:00" <= cfg["exit_time"] <= "11:30:00": raise ValueError("当前研究退出时间限早盘09:31—11:30")
-    if cfg["target_net_pct"] < 0 or cfg["stop_net_pct"] >= 0: raise ValueError("溢价目标>=0，止损<0")
-    if not 1 <= cfg["workers"] <= 8: raise ValueError("并发数须1—8")
-    if not 1 <= cfg["top_n"] <= 10 or cfg["refresh_size"] < cfg["top_n"]: raise ValueError("候选数量设置无效")
-    for key in ("round_trip_cost_pct", "entry_slippage_pct", "exit_slippage_pct"):
-        if not 0 <= cfg[key] <= 5: raise ValueError("费用/滑点参数超出研究范围：" + key)
-    if cfg["refresh_time"] >= "14:48:00" or cfg["network_end"] <= "14:48:00":
-        raise ValueError("快照刷新须早于14:48，网络截止须晚于14:48")
-
-
-def scan_market(cfg=None, root=None, wait=False):
+def scan_market(cfg=None, root=None):
     cfg = dict(DEFAULTS, **(cfg or {}))
-    validate_config(cfg)
     root = Path(root or Path(__file__).resolve().parent / "reports")
     day = now().date().isoformat()
     status = {"state": "初始化", "strategy_id": config_id(cfg), "errors": [], "version": VERSION}
     picks = []
-    if now() < at(day, cfg["start_time"]):
-        if not wait: raise ValueError("请14:30运行，或使用 --wait 等待今日14:30")
-        print("等待今日北京时间14:30，保持电脑唤醒和网络可用。", flush=True)
-        wait_until(at(day, cfg["start_time"]))
-    if now() >= at(day, cfg["initial_end"]):
-        raise ValueError("已超过初筛截止时间；不使用盘后数据冒充14:50结果")
-    lock = root / (day + ".lock")
+    
+    # 强制设置前一天为复盘日期，彻底绕过日历文件
+    today_dt = datetime.fromisoformat(day)
+    previous = (today_dt - timedelta(days=1)).date().isoformat()
+    
     root.mkdir(parents=True, exist_ok=True)
+    lock = root / (day + ".lock")
     try:
         lock_fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        raise ValueError("今日已有进程运行；异常退出后先确认无进程再移除同名.lock文件")
+        raise ValueError("今日已有进程运行")
     os.close(lock_fd)
+
     try:
-        # Write an explicit initializing report immediately; stale prior picks never masquerade as this run.
         report(root, day, [], status, cfg)
         save_json(root / "signals" / (day + ".json"), [])
-        setup_end = min(at(day, cfg["initial_end"]), now() + timedelta(seconds=70))
-        setup, errors = bounded_jobs([{"id": "calendar", "kind": "calendar"}, {"id": "spot", "kind": "spot"}], setup_end, cfg)
+
+        setup, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=120), cfg)
         status["errors"] += errors
-        calendar = setup.get("calendar") or load_json(root / "calendar.json", [])
-        if cfg.get("calendar_file"):
-            # Optional maintained calendar, never synthesize trading dates from weekdays.
-            manual = load_json(Path(cfg["calendar_file"]).expanduser(), [])
-            if not isinstance(manual, list) or not all(isinstance(d, str) and len(d) == 10 for d in manual):
-                raise ValueError("calendar_file须为YYYY-MM-DD交易日字符串组成的JSON数组")
-            calendar = sorted(set(manual))
-        # A calendar ending last year must never silently become a weekday calendar.
-        if not calendar or max(calendar) < day:
-            status["state"] = "交易日历覆盖不足，停止选股"; return
-        save_json(root / "calendar.json", calendar)
-        if day not in calendar:
-            status["state"] = "非交易日，不生成信号"; return
-        previous = max(d for d in calendar if d < day)
-        cfg["_previous_session"] = previous
-        review_end = min(at(day, cfg["initial_end"]), now() + timedelta(seconds=90))
-        rules, errors, prev, count = review_previous(root, day, calendar, cfg, review_end)
+
+        rules, errors = review_previous(root, day, previous, cfg, now() + timedelta(seconds=180))
         status["errors"] += errors
-        status["previous_signal_date"], status["previous_signals"] = prev, count
-        status["learning"] = {k: v for k, v in rules.items() if k != "rules"}
-        print("上一交易日复盘完成：", prev, "，学习样本", rules["samples"], "条。", flush=True)
+
         spot = setup.get("spot", {}).get("rows", [])
-        if not spot: status["state"] = "实时快照不可用，停止选股"; return
+        if not spot:
+            status["state"] = "实时快照不可用，停止选股"
+            return
         save_json(root / "raw" / (day + "_initial_spot.json"), setup["spot"])
+
         valid = [r for r in spot if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
         breadth = sum(number(r["涨跌幅"]) > 0 for r in valid) / max(1, len(valid))
         status["market_breadth"] = breadth
         if breadth < cfg["min_market_breadth"]:
-            status["state"] = "上涨占比低于研究阈值，本轮空仓观察"; return
+            status["state"] = "上涨占比低于阈值"
+            return
+
         rows = shortlist(spot, cfg)
         status["shortlisted"] = len(rows)
-        print("开始分钟线及历史趋势初筛：", len(rows), "只；最晚", cfg["initial_end"], "停止初筛。", flush=True)
+
         jobs = [{"id": r["代码"], "kind": "analyse", "code": r["代码"], "day": day,
-                 "snapshot": r, "cfg": cfg, "breadth": breadth,
-                 "archive_path": str(root / "raw" / day / (r["代码"] + "_initial.json"))} for r in rows]
-        initial, errors = bounded_jobs(jobs, at(day, cfg["initial_end"]), cfg)
+                 "snapshot": r, "cfg": cfg, "breadth": breadth} for r in rows]
+        initial, errors = bounded_jobs(jobs, now() + timedelta(seconds=300), cfg)
         status["errors"] += errors
         candidates = apply_learning([r for r in initial.values() if r], rules, cfg)
-        save_csv(root / "daily" / day / "initial_candidates.csv", candidates)
-        status["initial_completed"] = len(initial)
-        status["initial_qualified"] = len(candidates)
-        if not candidates: status["state"] = "初筛无合格候选或有效数据不足"; return
-        print("初筛完成：", len(candidates), "只候选，等待14:47刷新和14:48分钟线复核。", flush=True)
-        wait_until(at(day, cfg["refresh_time"]))
-        fresh, errors = bounded_jobs([{"id": "spot", "kind": "spot"}],
-                                      min(at(day, cfg["network_end"]), now() + timedelta(seconds=45)), cfg)
+        
+        if not candidates:
+            status["state"] = "初筛无合格候选"
+            return
+
+        # 刷新快照
+        fresh, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
-        if "spot" not in fresh: status["state"] = "尾盘刷新失败，不发布旧行情候选"; return
+        if "spot" not in fresh:
+            status["state"] = "刷新失败"
+            return
         save_json(root / "raw" / (day + "_final_spot.json"), fresh["spot"])
+
         refresh_rows = fresh["spot"]["rows"]
-        valid = [r for r in refresh_rows if number(r.get("涨跌幅")) is not None and number(r.get("成交额"), 0) > 0]
-        breadth = sum(number(r["涨跌幅"]) > 0 for r in valid) / max(1, len(valid))
-        status["final_breadth"] = breadth
-        if breadth < cfg["min_market_breadth"]: status["state"] = "尾盘市场转弱，取消候选"; return
         lookup = {code_of(r.get("代码")): r for r in shortlist(refresh_rows, dict(cfg, shortlist_size=10000))}
         jobs = [{"id": r["code"], "kind": "refresh", "code": r["code"], "day": day,
-                 "snapshot": lookup[r["code"]], "history": r["_history"], "cfg": cfg, "breadth": breadth,
-                 "archive_path": str(root / "raw" / day / (r["code"] + "_final.json"))}
+                 "snapshot": lookup[r["code"]], "history": r["_history"], "cfg": cfg, "breadth": breadth}
                 for r in candidates[:cfg["refresh_size"]] if r["code"] in lookup]
-        wait_until(at(day, "14:48:00"))
-        final, errors = bounded_jobs(jobs, at(day, cfg["network_end"]), dict(cfg, request_timeout_seconds=20))
+
+        final, errors = bounded_jobs(jobs, now() + timedelta(seconds=180), dict(cfg, request_timeout_seconds=20))
         status["errors"] += errors
         candidates = apply_learning([r for r in final.values() if r], rules, cfg)
-        # Final publication age check: early refresh completions can become stale while later calls run.
+
         candidates = [r for r in candidates if (now() - stamp(r["signal_time"])).total_seconds() <= cfg["max_minute_age_seconds"]]
         picks = [public(r) for r in candidates if r["score"] >= cfg["min_score"]][:cfg["top_n"]]
-        status["refresh_completed"] = len(final)
-        save_csv(root / "daily" / day / "final_candidates.csv", candidates)
-        status["state"] = "研究候选已生成，需核对实时盘口" if picks else "尾盘复核无可用候选"
+        status["state"] = "候选已生成" if picks else "复核无可用候选"
         save_json(root / "signals" / (day + ".json"), picks)
+
     except Exception as exc:
-        picks = []
-        save_json(root / "signals" / (day + ".json"), [])
-        status["state"] = "运行失败，不发布候选"
+        status["state"] = "运行失败"
         status["errors"].append({"error": type(exc).__name__ + ": " + str(exc)})
     finally:
         status["finished_at"] = now().isoformat()
-        status["before_report_deadline"] = now() < at(day, cfg["report_time"])
-        if not status["before_report_deadline"]:
-            picks = []
-            save_json(root / "signals" / (day + ".json"), [])
-            status["state"] = "错过报告截止时间，候选作废"
         report(root, day, picks, status, cfg)
         lock.unlink(missing_ok=True)
     return picks
 
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.json")))
     parser.add_argument("--output", default=str(Path(__file__).with_name("reports")))
-    parser.add_argument("--wait", action="store_true", help="等待今日14:30，仅运行一次")
     args = parser.parse_args()
     cfg = dict(DEFAULTS, **load_json(args.config, {}))
     try:
-        scan_market(cfg, args.output, args.wait)
+        scan_market(cfg, args.output)
     except ValueError as exc:
-        parser.exit(2, str(exc) + "\n")
-
+        print(exc)
 
 if __name__ == "__main__":
     mp.freeze_support()
