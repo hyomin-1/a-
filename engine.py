@@ -93,7 +93,6 @@ def save_csv(path, rows, empty_fields=("code", "name", "score")):
 
 
 def config_id(cfg):
-    # Only changes that alter labels / features invalidate learning samples.
     keys = ("target_net_pct", "stop_net_pct", "exit_time", "round_trip_cost_pct",
             "entry_slippage_pct", "exit_slippage_pct")
     packed = json.dumps({k: cfg[k] for k in keys}, sort_keys=True)
@@ -101,7 +100,6 @@ def config_id(cfg):
 
 
 def net_pct(entry, exit_price, cfg):
-    """entry already includes entry slippage; no double deduction."""
     sell = exit_price * (1 - cfg["exit_slippage_pct"] / 100)
     return (sell / entry - 1) * 100 - cfg["round_trip_cost_pct"]
 
@@ -145,7 +143,6 @@ def feature_tags(row):
 
 
 def analyse(snapshot, rows, history, asof, cfg, breadth):
-    """Only completed minute bars and prior-session daily bars enter features."""
     day = asof.date().isoformat()
     cutoff = asof.replace(second=0, microsecond=0) - timedelta(minutes=1)
     bars = clean_bars(rows, day, cutoff)
@@ -221,7 +218,6 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
 
 
 def review_signal(signal, rows, session, cfg):
-    """Earliest completed-minute close trigger; never use the day's highest price as a sale."""
     if session <= signal["signal_date"]:
         raise ValueError("T+1复盘日期必须晚于入选日期")
     end = at(session, cfg["exit_time"])
@@ -242,7 +238,6 @@ def review_signal(signal, rows, session, cfg):
         if change > cfg["target_net_pct"]:
             exit_bar, reason = bar, "正净溢价触发（分钟收盘代理）"
             break
-    # 一字/平盘分钟条可能没有可成交卖盘，不能据此宣称止损成交。
     ambiguous = exit_bar["high"] == exit_bar["low"]
     result = dict(public(signal))
     result.update({
@@ -258,7 +253,6 @@ def review_signal(signal, rows, session, cfg):
 
 
 def learn(outcomes, cfg, before_session):
-    """Use success AND failure samples from earlier observations, grouped by date."""
     samples = [r for r in outcomes if r.get("status") == "proxy_complete"
                and r.get("source") == "minute_proxy" and r.get("strategy_id") == config_id(cfg)
                and r.get("review_session", "9999") <= before_session]
@@ -274,7 +268,6 @@ def learn(outcomes, cfg, before_session):
         other = [r for r in samples if tag not in r.get("tags", [])]
         if min(len(group), len(other)) < cfg["min_learning_group"]: continue
         if min(len({r["signal_date"] for r in group}), len({r["signal_date"] for r in other})) < 5: continue
-        # One busy trading day must not dominate the comparison.
         def by_day(rows, fn):
             return statistics.mean(statistics.mean(fn(r) for r in rows if r["signal_date"] == d)
                                    for d in set(r["signal_date"] for r in rows))
@@ -298,9 +291,7 @@ def apply_learning(rows, rules, cfg):
     return sorted(rows, key=lambda r: (-r["score"], -r["amount_yuan"], r["code"]))
 
 
-
 def daily_analyse(snapshot, history, asof_text, cfg, breadth):
-    """Anytime fallback: score the latest completed daily bar, never pretend it is live intraday data."""
     asof = stamp(asof_text)
     rows = []
     for raw in history:
@@ -318,7 +309,7 @@ def daily_analyse(snapshot, history, asof_text, cfg, breadth):
     if len(rows) < 35: raise ValueError("有效日线不足35根")
     live_session = ("09:30" <= asof.strftime("%H:%M") <= "11:30") or ("13:00" <= asof.strftime("%H:%M") <= "15:00")
     if rows[-1]["date"] == asof.date().isoformat():
-        rows = rows[:-1]  # today is incomplete until the close auction has finished
+        rows = rows[:-1]
     if not rows: raise ValueError("尚无已完成日线")
     last = rows[-1]
     closes = [r["close"] for r in rows]
@@ -331,7 +322,6 @@ def daily_analyse(snapshot, history, asof_text, cfg, breadth):
         ema26 = value * (2/27) + ema26 * (25/27)
     macd = ema12 - ema26
     signal_line = macd
-    # Calculate MACD signal from rolling prefixes to avoid a one-point approximation.
     fast = slow = closes[0]; macds=[]
     for value in closes[1:]:
         fast = value * (2/13) + fast * (11/13)
@@ -380,7 +370,6 @@ def daily_analyse(snapshot, history, asof_text, cfg, breadth):
             "data_date":last["date"],"valid_until":"下一次运行前需重新核验"}
 
 def _worker(task, destination):
-    """Network work runs in killable child processes; use documented AkShare APIs only."""
     try:
         if task["kind"] == "test_hang":
             time.sleep(task["seconds"]); data = True
@@ -463,7 +452,6 @@ def _worker(task, destination):
 
 
 def bounded_jobs(tasks, deadline, cfg):
-    """Bound each call AND the entire batch; no ThreadPool shutdown waiting on blocked requests."""
     ctx = mp.get_context("spawn")
     results, errors, running = {}, [], {}
     queue = list(enumerate(tasks))
@@ -497,11 +485,6 @@ def bounded_jobs(tasks, deadline, cfg):
     return results, errors
 
 
-def wait_until(target):
-    while now() < target:
-        time.sleep(min(10, max(0.01, (target - now()).total_seconds())))
-
-
 def shortlist(rows, cfg):
     allowed = ("000", "001", "002", "003", "600", "601", "603", "605", "688", "689", "300", "301")
     result = []
@@ -515,7 +498,6 @@ def shortlist(rows, cfg):
         if amount < cfg["min_amount_yuan"]: continue
         row = dict(row, 代码=code)
         result.append(row)
-    # Heuristic preselection only, not an exhaustive market scan.
     def priority(r):
         return (-(abs(number(r.get("涨跌幅"), 0) - 2)), number(r.get("成交额"), 0))
     return sorted(result, key=priority, reverse=True)[:cfg["shortlist_size"]]
@@ -543,144 +525,5 @@ def review_previous(root, today, calendar, cfg, deadline):
         except ValueError as exc:
             result = dict(public(signal), review_session=today, status="pending_data", source="minute_proxy", success=None, error=str(exc))
         reviewed.append(result)
-    # Idempotent: reruns on the same session do not create extra observations.
     unique = {(r["signal_date"], r["code"], r.get("strategy_id")): r for r in outcomes}
-    unique.update({(r["signal_date"], r["code"], r.get("strategy_id")): r for r in reviewed})
-    outcomes = list(unique.values())
-    save_json(history_path, outcomes)
-    save_csv(root / "review" / (today + ".csv"), reviewed)
-    save_csv(root / "learning_outcomes.csv", outcomes)
-    rules = learn(outcomes, cfg, today)
-    save_json(root / "learned_rules.json", rules)
-    return rules, errors, previous, len(signals)
-
-
-def report(root, day, picks, status, cfg):
-    folder = root / "daily" / day
-    folder.mkdir(parents=True, exist_ok=True)
-    save_json(folder / "status.json", status)
-    save_csv(folder / "picks.csv", picks)
-    lines = ["# 尾盘隔夜研究报告 " + day, "", "状态：" + status["state"],
-             "生成时间：" + now().isoformat(), "", "14:30开始；14:47刷新快照；14:48复核分钟线；14:49:10停止网络任务；争取14:50前写出结果。",
-             "退出口径：下一交易日已完成的分钟收盘价，扣除估算成本后净收益 > " + str(cfg["target_net_pct"]) + "% 即触发退出代理。",
-             "研究默认：净止损 " + str(cfg["stop_net_pct"]) + "%，最晚 " + cfg["exit_time"] + " 退出；这两项未经用户确认，不是实盘指令。",
-             "费用参数是估计值，须按券商收费、最低佣金和交易金额修改；未接入券商，不自动下单或监控卖出。",
-             "", "## 候选（分数不代表胜率）", ""]
-    for i, row in enumerate(picks, 1):
-        lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜分钟参考价 {row['reference_price']}",
-                  f"   行情时间 {row['signal_time']}；数据获取时间 {row['received_at']}；有效至 {row['valid_until']}",
-                  "   理由：" + "；".join(row["reasons"]), "   复盘特征：" + "；".join(row["tags"]), ""]
-    if not picks: lines += ["无可用候选。请看状态和错误明细；接口故障或样本覆盖不足不等于市场没有机会。", ""]
-    lines += ["## 数据与学习", "", json.dumps(status, ensure_ascii=False, indent=2), "",
-              "raw文件夹留存原始分钟线；缺失数据标记待核验，不算失败或成功。",
-              "候选价是研究买入代理，不是真实买入；分钟收盘触发不是实际可成交证明。",
-              "复盘同时保留成功与失败样本；只读取已完成的下一交易日早盘，周末和节假日按交易日历处理。",
-              "达到样本数和跨日期门槛后，学习最多扣1分；可设apply_learning=false先做影子观察。尚未证实它会提高收益。",
-              "停牌、封死跌停、除权除息、公告事件及无法成交需要人工核验。"]
-    (folder / "report.md").write_text("\n".join(lines), encoding="utf-8")
-    print("报告：", folder / "report.md", flush=True)
-
-
-def validate_config(cfg):
-    if not 1 <= cfg["workers"] <= 8: raise ValueError("并发数须1—8")
-    if not 1 <= cfg["top_n"] <= 10: raise ValueError("候选数量设置无效")
-    if cfg["min_price"] <= 0 or cfg["max_price"] <= cfg["min_price"]: raise ValueError("价格区间设置无效")
-
-
-def scan_market(cfg=None, root=None, wait=False):
-    """Manual anytime scan: live snapshot during session; latest completed daily bars outside session."""
-    cfg = dict(DEFAULTS, **(cfg or {})); validate_config(cfg)
-    root = Path(root or Path(__file__).resolve().parent / "reports")
-    root.mkdir(parents=True, exist_ok=True)
-    started = now(); day = started.date().isoformat()
-    folder = root / "daily" / (day + "_" + started.strftime("%H%M%S"))
-    status = {"state":"正在获取行情", "version":VERSION, "started_at":started.isoformat(),
-              "errors":[], "mode":"intraday" if (("09:30" <= started.strftime("%H:%M") <= "11:30") or ("13:00" <= started.strftime("%H:%M") <= "15:00")) else "daily"}
-    picks=[]
-    try:
-        # Fetch a fresh all-market snapshot on every manual run.
-        got, errors = bounded_jobs([{"id":"spot","kind":"spot"}], started+timedelta(seconds=cfg["request_timeout_seconds"]), cfg)
-        status["errors"] += errors
-        if "spot" not in got or not got["spot"].get("rows"):
-            raise RuntimeError("全市场快照获取失败；本轮不输出虚假空选股结果")
-        spot=got["spot"]["rows"]; status["snapshot_received_at"]=got["spot"]["received_at"]; status["snapshot_api"]=got["spot"].get("api")
-        # Refresh the existing T+1 learning pipeline when today is a real trading session.
-        cal, cal_errors = bounded_jobs([{"id":"calendar","kind":"calendar"}], now()+timedelta(seconds=25), cfg)
-        status["errors"] += cal_errors
-        calendar = cal.get("calendar", [])
-        rules = load_json(root/"learned_rules.json", {"rules":[]})
-        if day in calendar:
-            try:
-                rules, review_errors, prev_day, prev_count = review_previous(root, day, calendar, cfg, now()+timedelta(seconds=90))
-                status["previous_signal_date"], status["previous_signals"] = prev_day, prev_count
-                status["learning_samples"] = rules.get("samples", 0)
-                status["errors"] += review_errors
-            except Exception as review_exc:
-                status["errors"].append({"task":"T+1复盘","error":type(review_exc).__name__+": "+str(review_exc)[:250]})
-        else:
-            status["learning_note"] = "非交易日或交易日历不可用，本次不执行T+1分钟复盘"
-        valid=[r for r in spot if number(r.get("涨跌幅")) is not None and number(r.get("成交额"),0)>0]
-        breadth=sum(number(r.get("涨跌幅"),0)>0 for r in valid)/max(1,len(valid))
-        status["market_breadth"]=round(breadth,4)
-        candidates=shortlist(spot,cfg); status["shortlisted"]=len(candidates)
-        if not candidates: raise RuntimeError("快照正常，但按价格/涨幅/成交额过滤后没有初选股")
-        jobs=[{"id":r["代码"],"kind":"daily","code":r["代码"],"day":day,"history_days":cfg["history_days"]} for r in candidates]
-        daily, errs=bounded_jobs(jobs, now()+timedelta(seconds=max(60,cfg["request_timeout_seconds"]*len(jobs)/max(1,cfg["workers"]))), cfg)
-        status["errors"]+=errs; status["daily_completed"]=len(daily)
-        scored=[]
-        for snap in candidates:
-            code=snap["代码"]
-            if code not in daily: continue
-            try:
-                row=daily_analyse(snap,daily[code],now().isoformat(),cfg,breadth)
-                if row: scored.append(row)
-            except Exception as exc:
-                status["errors"].append({"task":code,"error":type(exc).__name__+": "+str(exc)[:250]})
-        status["qualified_before_learning"]=len(scored)
-        # Keep historical learning files intact; apply existing learned rules if compatible.
-        scored=apply_learning(scored,rules,cfg)
-        picks=[public(r) for r in scored if r["score"]>=cfg["min_score"]][:cfg["top_n"]]
-        status["state"]="研究候选已生成，需核对实时盘口" if picks else "数据已读取，当前无达到评分门槛的候选"
-        status["data_mode"]="盘中最新快照价格+最近已完成日线指标" if status["mode"]=="intraday" else "最近已完成日线收盘+全市场快照；非盘中实时价"
-        status["data_date"] = max((r.get("data_date","") for r in picks), default="")
-        save_csv(folder/"picks.csv",picks)
-        save_csv(folder/"candidates.csv",scored)
-        if picks:
-            signal_day = max((r.get("signal_date", day) for r in picks), default=day)
-            save_json(root/"signals"/(signal_day+".json"),picks)
-        save_json(folder/"status.json",status)
-        lines=["# A股猎手研究报告", "", "运行时间："+started.isoformat(), "运行模式："+status["mode"],
-               "数据说明："+status["data_mode"], "市场上涨占比："+str(round(breadth*100,2))+"%", "", "## 候选"]
-        if not picks: lines += ["本轮没有达到评分门槛的股票。请区分市场无机会、过滤条件过严和单股数据缺失。"]
-        for i,r in enumerate(picks,1):
-            lines += [f"{i}. {r['name']}（{r['code']}）｜{r['score']:.2f}/10｜参考价 {r['reference_price']}",
-                      "   数据日期："+str(r.get("data_date"))+"；RSI14："+str(r.get("rsi14"))+"；MACD DIF/DEA："+str(r.get("macd_dif"))+"/"+str(r.get("macd_signal")),
-                      "   理由："+"；".join(r.get("reasons",[]))]
-        lines += ["", "## 运行状态", json.dumps(status,ensure_ascii=False,indent=2),
-                  "", "评分是研究排序，不是收益承诺；参考价不是实际成交价。盘后运行读取最近完成日线，不会伪装成实时盘中行情。"]
-        (folder/"report.md").write_text("\n".join(lines),encoding="utf-8")
-        print("报告：",folder/"report.md",flush=True)
-        return picks
-    except Exception as exc:
-        status["state"]="运行失败，未生成有效选股结果"
-        status["errors"].append({"error":type(exc).__name__+": "+str(exc)[:500]})
-        folder.mkdir(parents=True,exist_ok=True)
-        save_json(folder/"status.json",status); save_csv(folder/"picks.csv",[])
-        (folder/"report.md").write_text("# A股猎手运行失败\n\n"+json.dumps(status,ensure_ascii=False,indent=2),encoding="utf-8")
-        print("运行失败报告：",folder/"report.md",flush=True)
-        # Do not let GitHub Actions report a green success when the scan itself failed.
-        raise RuntimeError("A股猎手扫描失败；详情见 reports/daily/*/status.json 和 report.md") from exc
-
-
-def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config",default=str(Path(__file__).with_name("config.json")))
-    parser.add_argument("--output",default=str(Path(__file__).with_name("reports")))
-    parser.add_argument("--wait",action="store_true",help="兼容旧命令；新版不等待固定时间，立即运行")
-    args=parser.parse_args()
-    cfg=dict(DEFAULTS,**load_json(args.config,{}))
-    scan_market(cfg,args.output,False)
-
-
-if __name__ == "__main__":
-    mp.freeze_support(); main()
+    unique.update({(r["signal_date"], r["code"], r.get("strategy_id")): r for r
