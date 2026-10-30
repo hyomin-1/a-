@@ -1,6 +1,6 @@
 {
   "state": "实时快照不可用，停止选股",
-  "strategy_id": "manual-v8-sina-27d32c79d642",
+  "strategy_id": "steady-v1-27d32c79d642",
   "errors": [
     {
       "task": "spot",
@@ -10,6 +10,6 @@
       "error": "新浪行情返回空"
     }
   ],
-  "version": "manual-v8-sina",
-  "finished_at": "2026-10-30T21:20:03.680977+08:00"
+  "version": "steady-v1",
+  "finished_at": "2026-10-30T23:59:59.328553+08:00"
 }
