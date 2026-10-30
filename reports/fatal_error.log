@@ -1,0 +1,15 @@
+
+[2026-10-30T14:59:05.550180+08:00] TypeError: ufunc 'isfinite' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+Traceback (most recent call last):
+  File "/home/runner/work/a-/a-/hunter.py", line 998, in <module>
+    scan_market()
+  File "/home/runner/work/a-/a-/hunter.py", line 879, in scan_market
+    review_df, review_notes = review_previous_picks(previous_date, previous_df, spot_all)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/a-/a-/hunter.py", line 736, in review_previous_picks
+    _, diagnosis = diagnose_drop(old, new_price, pct_now)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/a-/a-/hunter.py", line 316, in diagnose_drop
+    if np.isfinite(market_pct) and market_pct <= -1:
+       ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: ufunc 'isfinite' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
