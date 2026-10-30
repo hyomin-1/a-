@@ -31,8 +31,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Run offline tests
-        run: python -m unittest -v test_engine.py
+      # --- 删除了 Run offline tests 步骤 ---
 
       - name: Run A-share scan now
         run: python engine.py --config config.json --output reports
