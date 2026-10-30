@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""随时可运行的筛选与复盘。仅生成研究信号，不连接券商。"""
+"""随时可运行的筛选与复盘。采用新浪+腾讯接口。"""
 from __future__ import annotations
 import argparse
 import csv
@@ -16,9 +16,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-VERSION = "manual-v1"
+VERSION = "manual-v3-tx"
 DEFAULTS = {
-    "workers": 2, "request_timeout_seconds": 40,
+    "workers": 4, "request_timeout_seconds": 40,
     "shortlist_size": 60, "refresh_size": 8, "top_n": 3, "min_score": 6.0,
     "min_amount_yuan": 100000000, "min_price": 3, "max_price": 150,
     "min_day_pct": -1, "max_day_pct": 5.5, "max_pullback_pct": 2.2,
@@ -119,7 +119,6 @@ def feature_tags(row):
     tags = []
     if row["day_pct"] >= 4: tags.append("当日涨幅>=4%")
     if row["deviation_ma10_pct"] >= 4: tags.append("偏离MA10>=4%")
-    if row["turnover_pct"] >= 12: tags.append("换手率>=12%")
     if row["momentum15_pct"] < 0: tags.append("尾盘15分钟走弱")
     if row["above_vwap_pct"] >= 2: tags.append("偏离分时均价>=2%")
     if row["breadth"] < 0.45: tags.append("市场上涨占比<45%")
@@ -134,13 +133,10 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     latest = bars[-1]
     if (asof - latest["ts"]).total_seconds() > cfg["max_minute_age_seconds"]:
         raise ValueError("分钟行情过期")
-    if bars[0]["ts"] > at(day, "09:35:00"):
-        raise ValueError("缺少早盘分钟线")
     
-    # 这里放宽了历史检查，避免绕过日历后报错
-    prior = [r for r in history if str(r.get("date", r.get("日期", "")))[:10] < day]
-    prior.sort(key=lambda r: str(r.get("date", r.get("日期", ""))))
-    closes = [number(r.get("close", r.get("收盘"))) for r in prior]
+    prior = [r for r in history if str(r.get("date", ""))[:10] < day]
+    prior.sort(key=lambda r: str(r.get("date", "")))
+    closes = [number(r.get("close")) for r in prior]
     closes = [x for x in closes if x is not None and x > 0]
     if len(closes) < 40:
         raise ValueError("上市历史日线不足40根")
@@ -166,13 +162,12 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     ma5 = statistics.mean((closes + [price])[-5:])
     above = (price / vwap - 1) * 100
     deviation = (price / ma10 - 1) * 100
-    turnover = number(snapshot.get("换手率"))
-    if turnover is None:
-        raise ValueError("缺少换手率")
+    
     if not (cfg["min_price"] <= price <= cfg["max_price"]): return None
     if not (cfg["min_day_pct"] <= day_pct <= cfg["max_day_pct"]): return None
     if amount < cfg["min_amount_yuan"] or pullback > cfg["max_pullback_pct"]: return None
-    if not (-0.2 <= above <= 3 and -0.4 <= momentum <= 2.5 and 0.5 <= turnover <= 20): return None
+    if not (-0.2 <= above <= 3 and -0.4 <= momentum <= 2.5): return None
+    
     score, reasons = 0.0, []
     if 0 <= above <= 1.5: score += 2; reasons.append("价格贴近且高于分时均价")
     else: score += 0.5
@@ -183,7 +178,7 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
     if price >= ma5: score += 1
     if 0 <= day_pct <= 4: score += 1
     if amount >= cfg["min_amount_yuan"] * 2: score += 1
-    if 2 <= turnover <= 12: score += 1
+    
     row = {
         "signal_date": day, "code": code_of(snapshot["代码"]), "name": snapshot["名称"],
         "signal_time": latest["ts"].isoformat(), "received_at": asof.isoformat(),
@@ -192,7 +187,7 @@ def analyse(snapshot, rows, history, asof, cfg, breadth):
         "score_raw": round(score, 3), "score": round(score, 3),
         "day_pct": day_pct, "momentum15_pct": momentum, "pullback_pct": pullback,
         "above_vwap_pct": above, "deviation_ma10_pct": deviation,
-        "turnover_pct": turnover, "amount_yuan": amount, "breadth": breadth,
+        "amount_yuan": amount, "breadth": breadth,
         "reasons": reasons, "strategy_id": config_id(cfg), "learning_penalty": 0.0,
         "valid_until": at(day, "23:59:59").isoformat(), "_history": prior,
     }
@@ -271,34 +266,48 @@ def apply_learning(rows, rules, cfg):
 
 def _worker(task, destination):
     try:
-        if task["kind"] == "test_hang":
-            time.sleep(task["seconds"])
-            data = True
-        else:
-            import akshare as ak
-            def records(frame):
-                return json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False))
+        import akshare as ak
+        
+        def records(frame):
+            if frame is None or frame.empty:
+                return []
+            return json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False))
+            
+        def safe_call(func, **kwargs):
+            for _ in range(3):
+                try:
+                    return func(**kwargs)
+                except Exception as e:
+                    time.sleep(2)
+                    if _ == 2: raise e
 
-            kind = task["kind"]
-            if kind == "spot":
-                data = {"rows": records(ak.stock_zh_a_spot_em()), "received_at": now().isoformat()}
-            elif kind in ("analyse", "refresh", "minutes"):
-                day, code = task["day"], task["code"]
-                frame = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="",
-                         start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
-                minutes = records(frame)
-                if kind == "minutes":
-                    data = minutes
-                else:
-                    history = task.get("history")
-                    if history is None:
-                        start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
-                        end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
-                        history = records(ak.stock_zh_a_hist_tx(symbol=("sh" if code.startswith("6") else "sz") + code,
-                                           start_date=start, end_date=end, adjust="qfq", timeout=12))
-                    data = analyse(task["snapshot"], minutes, history, now(), task["cfg"], task["breadth"])
+        kind = task["kind"]
+        if kind == "spot":
+            # 使用新浪全市场行情接口，完全避开东方财富
+            frame = safe_call(ak.stock_zh_a_spot)
+            data = {"rows": records(frame), "received_at": now().isoformat()}
+            
+        elif kind in ("analyse", "refresh", "minutes"):
+            day, code = task["day"], task["code"]
+            # 使用腾讯分钟线接口
+            frame = safe_call(ak.stock_zh_a_hist_min_tx, symbol=code, period="1", 
+                              start_date=day + " 09:30:00", end_date=day + " " + task.get("end_time", "14:57:00"))
+            minutes = records(frame)
+            
+            if kind == "minutes":
+                data = minutes
             else:
-                raise ValueError("Unknown task kind")
+                history = task.get("history")
+                if history is None:
+                    start = (datetime.fromisoformat(day) - timedelta(days=160)).strftime("%Y%m%d")
+                    end = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y%m%d")
+                    # 使用腾讯历史日线接口
+                    frame_hist = safe_call(ak.stock_zh_a_hist_tx, symbol=("sh" if code.startswith("6") else "sz") + code,
+                                       start_date=start, end_date=end, adjust="qfq", timeout=12)
+                    history = records(frame_hist)
+                data = analyse(task["snapshot"], minutes, history, now(), task["cfg"], task["breadth"])
+        else:
+            raise ValueError("Unknown task kind")
         save_json(destination, {"ok": True, "data": data})
     except Exception as exc:
         save_json(destination, {"ok": False, "error": type(exc).__name__ + ": " + str(exc)[:400]})
@@ -343,7 +352,11 @@ def shortlist(rows, cfg):
     for row in rows:
         name, code = str(row.get("名称", "")), code_of(row.get("代码", ""))
         if not code.startswith(allowed) or any(x in name.upper() for x in ("ST", "退", "N", "C")): continue
-        price, pct, amount = (number(row.get(x)) for x in ("最新价", "涨跌幅", "成交额"))
+        
+        price = number(row.get("最新价"))
+        pct = number(row.get("涨跌幅"))
+        amount = number(row.get("成交额"))
+        
         if any(x is None for x in (price, pct, amount)): continue
         if not cfg["min_price"] <= price <= cfg["max_price"]: continue
         if not cfg["min_day_pct"] <= pct <= cfg["max_day_pct"]: continue
@@ -390,8 +403,8 @@ def report(root, day, picks, status, cfg):
     save_csv(folder / "picks.csv", picks)
     lines = ["# 隔夜研究报告 " + day, "", "状态：" + status["state"],
              "生成时间：" + now().isoformat(), "",
-             "运行说明：本版本不受时间窗口限制，随时可手动运行；必须读取实时行情，分钟线超过 "
-             + str(cfg["max_minute_age_seconds"]) + " 秒即判定过期，不用收盘数据冒充实时信号。",
+             "运行说明：使用新浪+腾讯接口，不受时间窗口限制；分钟线超过 "
+             + str(cfg["max_minute_age_seconds"]) + " 秒即判定过期。",
              "", "## 候选（分数不代表胜率）", ""]
     for i, row in enumerate(picks, 1):
         lines += [f"{i}. {row['name']} {row['code']}｜{row['score']:.2f}/10｜参考价 {row['reference_price']}",
@@ -409,7 +422,6 @@ def scan_market(cfg=None, root=None):
     status = {"state": "初始化", "strategy_id": config_id(cfg), "errors": [], "version": VERSION}
     picks = []
     
-    # 强制设置前一天为复盘日期，彻底绕过日历文件
     today_dt = datetime.fromisoformat(day)
     previous = (today_dt - timedelta(days=1)).date().isoformat()
     
@@ -457,7 +469,6 @@ def scan_market(cfg=None, root=None):
             status["state"] = "初筛无合格候选"
             return
 
-        # 刷新快照
         fresh, errors = bounded_jobs([{"id": "spot", "kind": "spot"}], now() + timedelta(seconds=60), cfg)
         status["errors"] += errors
         if "spot" not in fresh:
