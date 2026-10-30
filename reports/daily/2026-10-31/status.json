@@ -1,0 +1,15 @@
+{
+  "state": "实时快照不可用，停止选股",
+  "strategy_id": "infinite-wait-v1-27d32c79d642",
+  "errors": [
+    {
+      "task": "spot",
+      "error": "请求超时"
+    },
+    {
+      "error": "新浪行情返回空，可能服务器屏蔽了海外IP或当前非交易日"
+    }
+  ],
+  "version": "infinite-wait-v1",
+  "finished_at": "2026-10-31T00:04:48.420229+08:00"
+}
