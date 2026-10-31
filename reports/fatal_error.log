@@ -13,3 +13,18 @@ Traceback (most recent call last):
     if np.isfinite(market_pct) and market_pct <= -1:
        ^^^^^^^^^^^^^^^^^^^^^^^
 TypeError: ufunc 'isfinite' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+
+[2026-10-31T21:45:47.840927+08:00] TypeError: ufunc 'isfinite' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+Traceback (most recent call last):
+  File "/home/runner/work/a-/a-/hunter.py", line 628, in <module>
+    scan_market()
+  File "/home/runner/work/a-/a-/hunter.py", line 566, in scan_market
+    review_df, review_notes = review_previous_picks(previous_date, previous_df, spot_all)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/a-/a-/hunter.py", line 462, in review_previous_picks
+    _, diagnosis = diagnose_drop(old, new_price, pct_now)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/a-/a-/hunter.py", line 173, in diagnose_drop
+    if np.isfinite(market_pct) and market_pct <= -1: reasons.append("市场整体走弱")
+       ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: ufunc 'isfinite' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
