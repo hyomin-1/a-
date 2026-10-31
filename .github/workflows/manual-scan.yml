@@ -1,4 +1,4 @@
-name: A股猎手-手动运行
+name: A股猎手-高级版全市场扫描
 
 on:
   workflow_dispatch:
@@ -26,13 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 执行自动测试
+      - name: 执行高级版扫描
+        # 设置并发数为 15，加快全市场 4000 只股票的分析速度
+        env:
+          A_SHARE_WORKERS: 15
         run: |
-          python -m unittest -v test_engine.py
-
-      - name: 执行新版A股全市场扫描
-        run: |
-          python hunter.py --config config.json --output reports
+          python hunter.py
 
       - name: 保存报告
         if: always()
@@ -43,6 +42,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有新报告"
           else
-            git commit -m "更新A股猎手扫描报告"
+            git commit -m "更新A股猎手高级版报告"
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
