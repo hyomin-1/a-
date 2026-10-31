@@ -19,3 +19,18 @@ Traceback (most recent call last):
     result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 TypeError: _to_float() takes 1 positional argument but 2 were given
+2026-10-31 12:56:55,677 [INFO] ============================================================
+2026-10-31 12:56:55,677 [INFO] A股猎手开始运行
+2026-10-31 12:56:55,677 [INFO] 扫描编号：20261031_125655
+2026-10-31 12:56:55,677 [INFO] ============================================================
+2026-10-31 12:56:55,677 [INFO] 步骤1：获取沪深A股全市场行情
+2026-10-31 12:57:23,417 [INFO] 全市场有效行情数量：5025
+2026-10-31 12:57:23,418 [INFO] 步骤2：计算市场整体涨跌情况
+2026-10-31 12:57:23,422 [INFO] 市场环境：市场偏弱，上涨比例：16.24%
+2026-10-31 12:57:23,423 [INFO] 步骤3：初步筛选候选股票
+2026-10-31 12:57:23,427 [INFO] 初步筛选得到 0 只候选股票
+2026-10-31 12:57:23,427 [ERROR] 扫描失败
+Traceback (most recent call last):
+  File "/home/runner/work/a-/a-/hunter.py", line 1027, in run_hunter
+    raise RuntimeError(
+RuntimeError: 初步筛选后没有候选股票。本轮不生成虚假的前三名。

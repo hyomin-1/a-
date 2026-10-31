@@ -1,12 +1,12 @@
 {
   "state": "运行失败，未生成有效选股结果",
   "version": "sina-tencent-v1",
-  "run_id": "20261031_125328",
-  "started_at": "2026-10-31T12:53:28+00:00",
-  "finished_at": "2026-10-31T12:53:54+00:00",
+  "run_id": "20261031_125655",
+  "started_at": "2026-10-31T12:56:55+00:00",
+  "finished_at": "2026-10-31T12:57:23+00:00",
   "errors": [
     {
-      "error": "TypeError: _to_float() takes 1 positional argument but 2 were given"
+      "error": "RuntimeError: 初步筛选后没有候选股票。本轮不生成虚假的前三名。"
     }
   ],
   "data_source": {
