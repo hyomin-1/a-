@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（纯新浪/腾讯接口版，彻底剔除东财）
+A股猎手升级版（纯新浪/腾讯接口版，彻底剔除东财，修复复盘崩溃Bug）
 """
 import os
 import re
@@ -20,7 +20,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 全市场扫描并发数，可以通过 GitHub Actions 环境变量覆盖，默认10
 MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "10"))
 TOP_N = 3
 MIN_SCORE = 5.5
@@ -101,7 +100,6 @@ def calculate_indicators(df):
     return df
 
 def fetch_board_flow():
-    """彻底剔除东财接口，返回空数据。"""
     status = {"行业": "因关闭东财接口，数据不可用", "概念": "因关闭东财接口，数据不可用"}
     boards = pd.DataFrame(columns=["板块类型", "板块名称", "资金流排名", "资金流值", "板块涨幅%"])
     return boards, {}, status
@@ -170,7 +168,9 @@ def diagnose_drop(old, current_price, current_pct, market_pct=None):
     old_pct = safe_float(old.get("涨幅%", old.get("涨跌幅")))
     change = (current_price / old_price - 1) * 100 if old_price > 0 and current_price > 0 else np.nan
     if np.isfinite(change) and change <= -2:
-        if np.isfinite(market_pct) and market_pct <= -1: reasons.append("市场整体走弱")
+        # 修复了这里 market_pct 可能是 None 导致的崩溃
+        if market_pct is not None and pd.notna(market_pct) and market_pct <= -1: 
+            reasons.append("市场整体走弱")
         if np.isfinite(old_rsi) and old_rsi >= 70: reasons.append("入选时RSI偏高")
         if np.isfinite(old_dev) and old_dev >= 5: reasons.append("入选时明显偏离MA10")
         if np.isfinite(old_turnover) and old_turnover >= 15: reasons.append("入选时换手率偏高")
@@ -222,7 +222,7 @@ def update_learning(previous_date, previous_df, current_spot, today):
         try:
             old_df = pd.read_csv(outcomes_path, dtype={"代码": str})
             new_df = pd.concat([old_df, new_df], ignore_index=True)
-        except Exception as exc: pass
+        except Exception: pass
     new_df["代码"] = new_df["代码"].map(normalize_code)
     new_df = new_df.drop_duplicates(["推荐日期", "复盘日期", "代码"], keep="last")
     new_df.to_csv(outcomes_path, index=False, encoding="utf-8-sig")
@@ -424,7 +424,6 @@ def process_single_stock(row, today_compact, board_map=None):
         return {"_error": f"{code} {name}: {type(exc).__name__}: {exc}", "_code": code}
 
 def get_spot_snapshot():
-    """彻底剔除东财，强制使用新浪快照。"""
     log("使用新浪接口获取全市场快照...")
     spot = ak.stock_zh_a_spot()
     source = "stock_zh_a_spot"
@@ -544,11 +543,10 @@ def scan_market():
     name_series = spot["名称"].astype(str)
     code_series = spot["纯代码"].astype(str)
     
-    # 核心过滤：剔除科创板(688)、北交所(8/4/9)、ST、退市，且排除涨停跌停
     condition_pct = np.where(
         code_series.str.startswith("3"),
-        spot["涨跌幅"] < 19.5,  # 创业板
-        spot["涨跌幅"] < 9.5    # 主板
+        spot["涨跌幅"] < 19.5,
+        spot["涨跌幅"] < 9.5
     )
     spot = spot[
         (~name_series.str.contains(r"ST|退", case=False, na=False))
