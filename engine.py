@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+"""A股猎手高级版（包含资金流、技术指标评分与复盘）"""
 import os
 import re
 import json
@@ -340,13 +341,12 @@ def apply_learned_penalties(candidates):
     return candidates
 
 def fetch_hist(code, today_compact):
-    symbol_tx = f"sh{code}" if code.startswith("6") else f"sz{code}"
     start_date = (sh_now() - timedelta(days=HISTORY_DAYS)).strftime("%Y%m%d")
     last_error = None
     for attempt in range(3):
         try:
-            hist = ak.stock_zh_a_hist_tx(
-                symbol=symbol_tx, start_date=start_date, end_date=today_compact, adjust="qfq"
+            hist = ak.stock_zh_a_hist(
+                symbol=code, period="daily", start_date=start_date, end_date=today_compact, adjust="qfq"
             )
             if hist is not None and len(hist) >= 20: return hist
             last_error = RuntimeError("历史行情为空或不足20条")
