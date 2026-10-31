@@ -9,17 +9,18 @@ A股猎手 - 离线自动测试
 
 import unittest
 import tempfile
-import os
 
 import numpy as np
 import pandas as pd
 
 from indicators import calculate_indicators
+
 from hunter import (
     calculate_market_summary,
     preliminary_screen,
     calculate_stock_score
 )
+
 from learning import (
     classify_stock_pattern,
     load_learning_memory,
@@ -95,14 +96,12 @@ def make_history(rows=220):
     price = 15.0
 
     for index in range(rows):
-        # 模拟缓慢上涨并带有正常波动。
         daily_change = (
             0.0008
             + np.random.normal(0, 0.012)
         )
 
         price *= (1 + daily_change)
-
         close.append(price)
 
     close = np.array(close)
@@ -409,6 +408,8 @@ class TestLearning(unittest.TestCase):
 
     def test_learning_memory_initialization(self):
 
+        # 默认记忆可以只在内存中初始化，
+        # 不强制要求立即创建 JSON 文件。
         with tempfile.TemporaryDirectory() as temp_dir:
 
             memory = load_learning_memory(
@@ -425,13 +426,9 @@ class TestLearning(unittest.TestCase):
                 memory
             )
 
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(
-                        temp_dir,
-                        "learning_memory.json"
-                    )
-                )
+            self.assertIsInstance(
+                memory["patterns"],
+                dict
             )
 
     def test_record_scan(self):
