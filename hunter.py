@@ -217,57 +217,70 @@ def calculate_market_summary(snapshot):
 # 三、初步筛选
 # ============================================================
 
+def _is_limit_up(stock, pct):
+    """
+    判断是否接近当日涨停。
+    沪深主板通常10%，ST通常5%；创业板/科创板通常20%；
+    北京市场通常30%（当前配置默认不纳入）。
+    对新股无涨跌幅限制的交易日，无法仅凭涨幅准确识别，故不作虚假判断。
+    """
+    code = str(stock.get("code", "")).strip()
+    code = code.lower().replace("sh", "").replace("sz", "")
+    name = str(stock.get("name", "")).upper()
+
+    if "ST" in name or "*ST" in name:
+        limit_pct = 5.0
+    elif code.startswith(("300", "301", "688", "689")):
+        limit_pct = 20.0
+    elif code.startswith(("4", "8")):
+        limit_pct = 30.0
+    else:
+        limit_pct = 10.0
+
+    # 留出少量行情四舍五入误差，排除涨停及接近涨停的股票
+    return pct >= limit_pct - 0.15
+
+
 def preliminary_screen(snapshot, config):
     """
-    从全市场快照中筛选候选股票。
-
-    先按价格、涨幅、成交额过滤，
-    再按成交额排序取前N只进行历史K线分析。
+    初筛规则：
+    1. 股价大于0且不超过800元；
+    2. 排除当日跌幅达到或超过10%的股票；
+    3. 排除当日涨停/接近涨停的股票；
+    4. 不设置成交额门槛；
+    5. 不因市场弱而放宽条件或强行补造候选。
+    最终由MACD、RSI、均线、量价、位置及风险评分排序。
     """
-
     settings = config.get("screening", {})
-
-    min_price = float(settings.get("min_price", 3))
-    max_price = float(settings.get("max_price", 150))
-
-    min_amount = float(
-        settings.get("min_amount_yuan", 100000000)
-    )
-
-    min_pct = float(settings.get("min_day_pct", -1))
-    max_pct = float(settings.get("max_day_pct", 5.5))
-
-    shortlist_size = int(
-        settings.get("shortlist_size", 60)
-    )
+    max_price = float(settings.get("max_price", 800))
+    min_price = float(settings.get("min_price", 0))
+    shortlist_size = max(1, int(settings.get("shortlist_size", 120)))
 
     candidates = []
-
     for item in snapshot:
-
         price = safe_float(item.get("price"))
-        amount = safe_float(item.get("amount"), 0)
         pct = safe_float(item.get("change_pct"))
 
-        if price is None or pct is None:
+        if price is None or pct is None or price <= 0:
             continue
-
         if price < min_price or price > max_price:
             continue
 
-        if amount < min_amount:
+        # 排除跌幅达到10%及以上（含跌停）
+        if pct <= -10.0:
             continue
 
-        if pct < min_pct or pct > max_pct:
+        # 排除涨停及接近涨停
+        if _is_limit_up(item, pct):
             continue
 
         candidates.append(item)
 
+    # 成交额不作为准入门槛，仅用于候选池内优先处理流动性较好的股票。
     candidates.sort(
-        key=lambda x: safe_float(x.get("amount"), 0),
+        key=lambda x: safe_float(x.get("amount"), 0) or 0,
         reverse=True
     )
-
     return candidates[:shortlist_size]
 
 
@@ -1045,13 +1058,6 @@ def run_hunter(
             )
 
         # 5. 选出前三名。
-        minimum_score = float(
-            config.get("screening", {}).get(
-                "min_score",
-                6.0
-            )
-        )
-
         top_n = int(
             config.get("screening", {}).get(
                 "top_n",
@@ -1059,12 +1065,13 @@ def run_hunter(
             )
         )
 
-        qualified = [
-            item for item in analyzed
-            if item.get("score", 0) >= minimum_score
-        ]
-
-        recommendations = qualified[:top_n]
+        # 用户要求：无论是否达到最低分，都从本轮有效分析结果中选出评分最高的股票。
+        # 不足三只时按实际数量输出，不虚构股票。
+        analyzed.sort(
+            key=lambda item: safe_float(item.get("score"), 0) or 0,
+            reverse=True
+        )
+        recommendations = analyzed[:top_n]
 
         # 6. 保存报告。
         logger.info("步骤5：保存扫描报告")
