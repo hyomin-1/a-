@@ -12,7 +12,7 @@
     "tencent_batch_size": 80
   },
   "screening": {
-    "shortlist_size": 120,
+    "shortlist_size": 6000,
     "top_n": 3,
     "min_price": 0,
     "max_price": 800
