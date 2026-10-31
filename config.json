@@ -2,7 +2,6 @@
 {
   "project_name": "A股猎手",
   "version": "sina-tencent-v1",
-
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
@@ -12,7 +11,6 @@
     "exclude_st": true,
     "exclude_delisting": true
   },
-
   "data_source": {
     "realtime_primary": "sina",
     "realtime_fallback": "tencent",
@@ -27,14 +25,12 @@
     "verify_required_fields": true,
     "minimum_snapshot_ratio": 0.70
   },
-
   "history": {
     "provider": "tencent",
     "history_days": 220,
     "minimum_history_rows": 60,
     "adjust": "qfq"
   },
-
   "screening": {
     "shortlist_size": 60,
     "top_n": 3,
@@ -46,7 +42,6 @@
     "max_day_pct": 5.5,
     "min_market_breadth": 0.35
   },
-
   "indicators": {
     "ma_periods": [5, 10, 20, 60],
     "macd_fast": 12,
@@ -56,7 +51,6 @@
     "volume_ratio_min": 1.15,
     "volume_ratio_max": 2.8
   },
-
   "scoring": {
     "maximum_score": 10.0,
     "minimum_score": 6.0,
@@ -68,14 +62,12 @@
     "order_book_weight": 0.8,
     "risk_penalty_enabled": true
   },
-
   "sector": {
     "use_sector_fund_flow": false,
     "use_market_breadth_proxy": true,
     "minimum_sector_stocks": 5,
     "sector_top_n": 12
   },
-
   "learning": {
     "enabled": true,
     "apply_learning": true,
@@ -86,7 +78,6 @@
     "max_learning_penalty": 1.0,
     "review_after_sessions": [1, 5, 10]
   },
-
   "risk": {
     "reference_take_profit_pct": 3.0,
     "reference_stop_loss_pct": 2.0,
@@ -94,7 +85,6 @@
     "avoid_high_rsi": 75,
     "avoid_extreme_volume_ratio": 4.0
   },
-
   "output": {
     "directory": "reports",
     "save_run_history": true,
