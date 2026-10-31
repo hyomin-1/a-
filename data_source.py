@@ -4,8 +4,8 @@
 A股猎手 - 行情数据模块
 
 实时行情：
-1. 新浪财经为主
-2. 腾讯行情为备用
+1. 腾讯财经为主（适配GitHub Actions环境）
+2. 新浪财经为备用（遇403停止重试）
 
 历史K线：
 腾讯财经
@@ -44,8 +44,8 @@ SESSION.headers.update({
 
 SOURCE_STATUS = {
     "universe_source": None,
-    "realtime_primary": "sina",
-    "realtime_fallback": "tencent",
+    "realtime_primary": "tencent",
+    "realtime_fallback": "sina",
     "history_source": "tencent",
     "universe_count": 0,
     "snapshot_count": 0,
@@ -599,159 +599,91 @@ def _chunks(items: List[str], size: int):
 
 
 def get_market_snapshot(config: dict) -> List[dict]:
+    """获取全市场实时快照：腾讯优先，新浪备用。
+
+    新浪 hq.sinajs.cn 在 GitHub Actions 环境出现 403 时，
+    不再反复请求；直接使用腾讯行情补齐，避免整轮扫描被新浪阻断。
     """
-    获取全市场实时快照。
-
-    优先使用新浪批量行情。
-    新浪某批次失败或数据缺失时，使用腾讯补齐。
-
-    只有达到最低覆盖率才返回结果。
-    """
-
     source_config = _source_config(config)
-
     universe = get_stock_universe(config)
+    codes = []
+    for item in universe:
+        try:
+            code = _normalize_code(item.get("code", ""))
+            if _is_allowed_code(code, _market_config(config)):
+                codes.append(code)
+        except (TypeError, ValueError):
+            continue
+    codes = list(dict.fromkeys(codes))
+    if not codes:
+        raise RuntimeError("股票代码列表为空，停止扫描")
 
-    codes = [item["code"] for item in universe]
-
-    sina_batch_size = int(
-        source_config.get("sina_batch_size", 80)
-    )
-
-    tencent_batch_size = int(
-        source_config.get("tencent_batch_size", 80)
-    )
-
-    max_workers = int(
-        source_config.get("max_workers", 4)
-    )
-
+    batch_size = int(source_config.get("tencent_batch_size", 80))
+    workers = max(1, int(source_config.get("max_workers", 4)))
+    batches = list(_chunks(codes, batch_size))
     snapshot = {}
-    failed_codes = []
 
-    sina_batches = list(
-        _chunks(codes, sina_batch_size)
-    )
+    def fetch_batch(batch):
+        return _fetch_tencent_quotes(batch, config)
 
-    def fetch_sina_batch(batch):
-        return _fetch_sina_quotes(batch, config)
-
-    with ThreadPoolExecutor(
-        max_workers=max(1, max_workers)
-    ) as executor:
-
-        futures = {
-            executor.submit(fetch_sina_batch, batch): batch
-            for batch in sina_batches
-        }
-
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_batch, batch): batch for batch in batches}
         for future in as_completed(futures):
-
             batch = futures[future]
-
             try:
                 data = future.result()
                 snapshot.update(data)
-
-                missing = [
-                    code for code in batch
-                    if code not in data
-                ]
-
-                failed_codes.extend(missing)
-
+                missing = [code for code in batch if code not in data]
+                if missing:
+                    _record_error("tencent_missing_quotes", f"缺少 {len(missing)} 只")
             except Exception as exc:
-                _record_error("sina_realtime_batch", exc)
-                failed_codes.extend(batch)
+                _record_error("tencent_realtime_batch", exc)
 
-    # 新浪获取成功的数量。
-    SOURCE_STATUS["sina_count"] = len(snapshot)
+    SOURCE_STATUS["realtime_primary"] = "tencent"
+    SOURCE_STATUS["realtime_fallback"] = "sina"
+    SOURCE_STATUS["tencent_count"] = len(snapshot)
 
-    # 对新浪缺失的数据使用腾讯补齐。
-    failed_codes = list(dict.fromkeys(failed_codes))
+    # 腾讯未返回的股票才尝试新浪；新浪403时记录一次失败，不影响已取得的腾讯行情。
+    missing_codes = [code for code in codes if code not in snapshot]
+    sina_size = int(source_config.get("sina_batch_size", 80))
+    sina_result = {}
+    for batch in _chunks(missing_codes, sina_size):
+        try:
+            sina_result.update(_fetch_sina_quotes(batch, config))
+        except Exception as exc:
+            message = str(exc)
+            _record_error("sina_fallback_batch", message)
+            if "403" in message or "Forbidden" in message:
+                logger.warning("新浪接口返回403，停止后续新浪备用请求")
+                break
 
-    tencent_result = {}
-
-    tencent_batches = list(
-        _chunks(failed_codes, tencent_batch_size)
-    )
-
-    def fetch_tencent_batch(batch):
-        return _fetch_tencent_quotes(batch, config)
-
-    with ThreadPoolExecutor(
-        max_workers=max(1, max_workers)
-    ) as executor:
-
-        futures = {
-            executor.submit(fetch_tencent_batch, batch): batch
-            for batch in tencent_batches
-        }
-
-        for future in as_completed(futures):
-
-            try:
-                tencent_result.update(future.result())
-
-            except Exception as exc:
-                _record_error("tencent_fallback_batch", exc)
-
-    # 只补充新浪缺失的股票，不覆盖新浪已成功的数据。
-    for code, item in tencent_result.items():
-        if code not in snapshot:
-            snapshot[code] = item
-
-    SOURCE_STATUS["tencent_count"] = len(tencent_result)
+    for code, item in sina_result.items():
+        snapshot.setdefault(code, item)
+    SOURCE_STATUS["sina_count"] = len(sina_result)
     SOURCE_STATUS["snapshot_count"] = len(snapshot)
+    SOURCE_STATUS["universe_count"] = len(codes)
 
-    total = len(universe)
-
-    if total <= 0:
-        raise RuntimeError("股票列表为空")
-
-    coverage = len(snapshot) / total
-
-    minimum_ratio = float(
-        source_config.get("minimum_snapshot_ratio", 0.70)
-    )
-
+    coverage = len(snapshot) / len(codes)
+    minimum_ratio = float(source_config.get("minimum_snapshot_ratio", 0.70))
     if coverage < minimum_ratio:
         raise RuntimeError(
             "全市场行情覆盖率不足，停止本轮选股。"
-            f"股票总数={total}，"
-            f"有效行情={len(snapshot)}，"
-            f"覆盖率={coverage:.1%}，"
-            f"最低要求={minimum_ratio:.1%}"
+            f"股票总数={len(codes)}，有效行情={len(snapshot)}，"
+            f"覆盖率={coverage:.1%}，最低要求={minimum_ratio:.1%}。"
+            "请检查腾讯接口或股票列表接口是否可访问。"
         )
 
-    # 将股票列表中已有的名称、换手率补充到快照。
-    universe_map = {
-        item["code"]: item for item in universe
-    }
-
+    universe_map = {item["code"]: item for item in universe if item.get("code")}
     result = []
-
     for code, item in snapshot.items():
-
-        original = universe_map.get(code, {})
-
         merged = dict(item)
-
+        original = universe_map.get(code, {})
         if not merged.get("name"):
             merged["name"] = original.get("name", "")
-
         if merged.get("turnover_rate") is None:
-            merged["turnover_rate"] = original.get(
-                "turnover_rate"
-            )
-
+            merged["turnover_rate"] = original.get("turnover_rate")
         result.append(merged)
-
-    result.sort(
-        key=lambda item: item.get("amount", 0),
-        reverse=True
-    )
-
+    result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
     return result
 
 
