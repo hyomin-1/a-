@@ -3,3 +3,19 @@
 2026-10-31 12:46:31,982 [INFO] 扫描编号：20261031_124631
 2026-10-31 12:46:31,982 [INFO] ============================================================
 2026-10-31 12:46:31,982 [INFO] 步骤1：获取沪深A股全市场行情
+2026-10-31 12:53:28,091 [INFO] ============================================================
+2026-10-31 12:53:28,091 [INFO] A股猎手开始运行
+2026-10-31 12:53:28,092 [INFO] 扫描编号：20261031_125328
+2026-10-31 12:53:28,092 [INFO] ============================================================
+2026-10-31 12:53:28,092 [INFO] 步骤1：获取沪深A股全市场行情
+2026-10-31 12:53:54,367 [ERROR] 扫描失败
+Traceback (most recent call last):
+  File "/home/runner/work/a-/a-/hunter.py", line 988, in run_hunter
+    snapshot = get_market_snapshot(config)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/a-/a-/data_source.py", line 686, in get_market_snapshot
+    result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
+  File "/home/runner/work/a-/a-/data_source.py", line 686, in <lambda>
+    result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _to_float() takes 1 positional argument but 2 were given
