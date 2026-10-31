@@ -3,6 +3,7 @@ import json
 import re
 import time
 import logging
+import random
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,7 +24,7 @@ SOURCE_STATUS = {"errors": []}
 def _record_error(task: str, error: Any) -> None:
     SOURCE_STATUS["errors"].append({"task": str(task), "error": str(error)[:500]})
 
-def _request(url: str, params: Optional[dict] = None, timeout: int = 15, retry_times: int = 2, encoding: Optional[str] = None) -> str:
+def _request(url: str, params: Optional[dict] = None, timeout: int = 15, retry_times: int = 3, encoding: Optional[str] = None) -> str:
     last_error = None
     for attempt in range(max(1, retry_times + 1)):
         try:
@@ -34,7 +35,8 @@ def _request(url: str, params: Optional[dict] = None, timeout: int = 15, retry_t
             return response.text
         except Exception as exc:
             last_error = exc
-            if attempt < retry_times: time.sleep(1)
+            if attempt < retry_times: 
+                time.sleep(random.uniform(1.0, 3.0))
     raise RuntimeError(f"请求失败：{last_error}")
 
 def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -74,7 +76,7 @@ def _fetch_tencent_quotes(codes: List[str]) -> Dict[str, dict]:
     return result
 
 def get_market_snapshot(config: dict) -> List[dict]:
-    # 生成主板和创业板的代码池
+    # 仅生成主板和创业板的代码池，彻底排除科创(688)和北交(8/4/9)
     codes = []
     for prefix in ["600", "601", "603", "605", "000", "001", "002", "003", "300", "301"]:
         for i in range(1000):
