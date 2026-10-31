@@ -1,104 +1,33 @@
 {
-  "project_name": "A股猎手",
   "version": "sina-tencent-v1",
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
     "include_chinext": true,
-    "include_star_market": true,
-    "include_beijing": false,
-    "exclude_st": true,
-    "exclude_delisting": true
+    "include_star_market": false,
+    "include_beijing": false
   },
   "data_source": {
-    "realtime_primary": "sina",
-    "realtime_fallback": "tencent",
-    "allow_eastmoney": false,
-    "allow_akshare": false,
-    "sina_batch_size": 80,
-    "tencent_batch_size": 80,
-    "request_timeout_seconds": 15,
-    "retry_times": 2,
-    "retry_interval_seconds": 2,
     "max_workers": 4,
-    "verify_required_fields": true,
-    "minimum_snapshot_ratio": 0.7
-  },
-  "history": {
-    "provider": "tencent",
-    "history_days": 220,
-    "minimum_history_rows": 60,
-    "adjust": "qfq"
+    "tencent_batch_size": 80
   },
   "screening": {
     "shortlist_size": 120,
     "top_n": 3,
-    "min_score": 0,
     "min_price": 0,
-    "max_price": 800,
-    "min_amount_yuan": 0,
-    "min_day_pct": -10,
-    "max_day_pct": 30,
-    "min_market_breadth": 0.35
+    "max_price": 800
   },
   "indicators": {
-    "ma_periods": [
-      5,
-      10,
-      20,
-      60
-    ],
+    "ma_periods": [5, 10, 20, 60],
     "macd_fast": 12,
     "macd_slow": 26,
     "macd_signal": 9,
-    "rsi_period": 14,
-    "volume_ratio_min": 1.15,
-    "volume_ratio_max": 2.8
-  },
-  "scoring": {
-    "maximum_score": 10.0,
-    "minimum_score": 6.0,
-    "sector_strength_weight": 1.7,
-    "technical_weight": 2.5,
-    "price_volume_weight": 1.5,
-    "low_position_weight": 1.5,
-    "market_environment_weight": 1.0,
-    "order_book_weight": 0.8,
-    "risk_penalty_enabled": true
-  },
-  "sector": {
-    "use_sector_fund_flow": false,
-    "use_market_breadth_proxy": true,
-    "minimum_sector_stocks": 5,
-    "sector_top_n": 12
+    "rsi_period": 14
   },
   "learning": {
-    "enabled": true,
-    "apply_learning": true,
-    "learning_window_sessions": 60,
-    "min_learning_samples": 30,
-    "min_learning_dates": 10,
-    "min_learning_group": 12,
-    "max_learning_penalty": 1.0,
-    "review_after_sessions": [
-      1,
-      5,
-      10
-    ]
-  },
-  "risk": {
-    "reference_take_profit_pct": 3.0,
-    "reference_stop_loss_pct": 2.0,
-    "max_daily_rise_pct": 5.5,
-    "avoid_high_rsi": 75,
-    "avoid_extreme_volume_ratio": 4.0
+    "enabled": true
   },
   "output": {
-    "directory": "reports",
-    "save_run_history": true,
-    "save_recommendation_history": true,
-    "save_learning_memory": true,
-    "save_data_source_status": true,
-    "keep_empty_run_snapshot": true
+    "directory": "reports"
   }
 }
