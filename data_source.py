@@ -160,25 +160,25 @@ def _tencent_symbol(code: str) -> str:
     raise ValueError(f"暂不支持的股票市场代码：{code}")
 
 
-def _to_float(value: Any) -> Optional[float]:
+def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None:
-            return None
+            return default
 
         text = str(value).strip()
 
         if not text or text in ("-", "--", "None", "null"):
-            return None
+            return default
 
         result = float(text)
 
         if result != result:
-            return None
+            return default
 
         return result
 
     except (TypeError, ValueError):
-        return None
+        return default
 
 
 def _is_valid_stock_name(name: str, market_config: dict) -> bool:
