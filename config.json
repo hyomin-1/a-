@@ -1,33 +1,65 @@
 {
-  "version": "sina-tencent-v1",
+  "version": "overnight-scalping-v1",
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
     "include_chinext": true,
-    "include_star_market": false,
-    "include_beijing": false
+    "include_star_market": true,
+    "include_beijing": false,
+    "exclude_st": true,
+    "exclude_delisting": true
   },
   "data_source": {
-    "max_workers": 4,
-    "tencent_batch_size": 80
+    "realtime_primary": "tencent",
+    "realtime_fallback": "sina",
+    "history_source": "tencent",
+    "max_workers": 8,
+    "tencent_batch_size": 80,
+    "sina_batch_size": 80,
+    "request_timeout_seconds": 15,
+    "retry_times": 1,
+    "minimum_snapshot_ratio": 0.65
+  },
+  "history": {
+    "history_days": 180,
+    "minimum_history_rows": 60,
+    "adjust": "qfq"
   },
   "screening": {
-    "shortlist_size": 6000,
-    "top_n": 3,
     "min_price": 0,
-    "max_price": 800
+    "max_price": 800,
+    "min_amount_yuan": 0,
+    "max_daily_loss_pct": -10,
+    "top_n": 3,
+    "min_score": 0,
+    "candidate_display_limit": 100
   },
   "indicators": {
+    "daily_macd_fast": 12,
+    "daily_macd_slow": 26,
+    "daily_macd_signal": 9,
+    "rsi_period": 14,
     "ma_periods": [5, 10, 20, 60],
-    "macd_fast": 12,
-    "macd_slow": 26,
-    "macd_signal": 9,
-    "rsi_period": 14
+    "intraday_macd_period": "5m"
+  },
+  "overnight": {
+    "buy_observation_time": "14:50",
+    "sell_observation_start": "09:30",
+    "sell_observation_end": "09:40",
+    "take_profit_levels": [0.005, 0.01, 0.02],
+    "default_stop_loss_pct": 0.008,
+    "support_buffer_pct": 0.003
   },
   "learning": {
-    "enabled": true
+    "enabled": true,
+    "review_previous_picks": true,
+    "save_candidate_history": true,
+    "save_recommendation_history": true
   },
   "output": {
-    "directory": "reports"
+    "directory": "reports",
+    "save_markdown_report": true,
+    "save_csv": true,
+    "save_status_json": true
   }
 }
