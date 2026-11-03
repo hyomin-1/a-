@@ -59,10 +59,11 @@ def macd(series):
 def get_15m(code):
     """腾讯15分钟K线。获取失败返回None，不用日线数据冒充分时。"""
     symbol = ("sh" if code.startswith(("6", "9")) else "sz") + code
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # 腾讯分钟线专用的正确接口地址
+    url = "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline"
     try:
         r = requests.get(
-            url, params={"param": f"{symbol},m15,,,120,qfq"},
+            url, params={"param": f"{symbol},m15,,320"},
             headers={"User-Agent": "Mozilla/5.0"}, timeout=10
         )
         r.raise_for_status()
