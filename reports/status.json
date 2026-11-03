@@ -11,10 +11,10 @@
     "成交额亿元": 1.7,
     "市场热度": "偏冷"
   },
-  "candidate_count": 4875,
+  "candidate_count": 4879,
   "pick_count": 3,
-  "errors": 28,
-  "seconds": 168.1,
+  "errors": 24,
+  "seconds": 159.5,
   "data_source": {
     "universe_source": "sina",
     "realtime_primary": "tencent",
