@@ -56,37 +56,6 @@ def macd(series):
     return dif, dea, hist
 
 
-def get_15m(code):
-    """腾讯15分钟K线。获取失败返回None，不用日线数据冒充分时。"""
-    symbol = ("sh" if code.startswith(("6", "9")) else "sz") + code
-    # 腾讯分钟线专用的正确接口地址
-    url = "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline"
-    try:
-        r = requests.get(
-            url, params={"param": f"{symbol},m15,,320"},
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
-        )
-        r.raise_for_status()
-        node = r.json().get("data", {}).get(symbol, {})
-        rows = node.get("m15") or node.get("qfq_m15") or []
-        if len(rows) < 30:
-            return None
-        df = pd.DataFrame(rows)
-        df = df.iloc[:, :6]
-        df.columns = ["date", "open", "close", "high", "low", "volume"]
-        for c in ["open", "close", "high", "low", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["close"])
-        if len(df) < 30:
-            return None
-        df["DIF"], df["DEA"], df["MACD"] = macd(df["close"])
-        df["RSI"] = rsi(df["close"], 14)
-        return df
-    except Exception as exc:
-        log(f"{code} 15分钟数据不可用：{exc}")
-        return None
-
-
 def limit_rate(code, name):
     name = str(name).upper()
     if "ST" in name:
@@ -154,34 +123,7 @@ def analyze_one(stock, config):
     support, resistance, m20, m60 = support_resistance(hist, price)
     deviation20 = (price / m20 - 1) * 100 if m20 > 0 else np.nan
 
-    # 15分钟动能。
-    intraday = get_15m(code)
-    m15_state = "分钟数据缺失"
-    m15_rsi = np.nan
-    m15_macd_up = False
-    m15_score = 0.0
-
-    if intraday is not None and len(intraday) >= 30:
-        a = intraday.iloc[-1]
-        b = intraday.iloc[-2]
-        m15_rsi = fnum(a["RSI"])
-        m15_macd_up = fnum(a["MACD"]) > fnum(b["MACD"])
-
-        if fnum(a["DIF"]) > fnum(a["DEA"]) and m15_macd_up:
-            m15_score += 1.4
-            m15_state = "15分钟MACD偏强"
-        elif fnum(a["DIF"]) > fnum(a["DEA"]):
-            m15_score += 0.8
-            m15_state = "15分钟MACD多头"
-        else:
-            m15_state = "15分钟动能偏弱"
-
-        if 48 <= m15_rsi <= 68:
-            m15_score += 0.6
-        elif m15_rsi > 78:
-            m15_score -= 0.5
-
-    # 10分制隔夜评分。
+    # 评分逻辑
     score = 0.0
     reasons, risks = [], []
 
@@ -214,13 +156,7 @@ def analyze_one(stock, config):
     elif drsi > 78:
         risks.append("日线RSI过热")
 
-    score += m15_score
-    if m15_state != "分钟数据缺失":
-        reasons.append(m15_state)
-    else:
-        risks.append("缺少15分钟数据，尾盘时机判断不完整")
-
-    # 当日涨幅适中，避免追高。
+    # 当日涨幅适中
     if 0.2 <= pct <= 3.5:
         score += 0.7
         reasons.append("当日涨幅适中")
@@ -246,7 +182,7 @@ def analyze_one(stock, config):
         score += 0.5
         reasons.append("上方有一定空间")
 
-    # 量价。
+    # 量价
     volume = fnum(hist["volume"].iloc[-1])
     avg_volume = fnum(hist["volume"].tail(5).mean())
     volume_ratio = volume / avg_volume if avg_volume > 0 else np.nan
@@ -256,7 +192,7 @@ def analyze_one(stock, config):
     elif np.isfinite(volume_ratio) and volume_ratio > 4:
         risks.append("成交量异常放大，注意分歧")
 
-    # 市场数据的委比/内外盘可能不存在，缺失不加分。
+    # 委比/内外盘
     outer = fnum(stock.get("outer"))
     inner = fnum(stock.get("inner"))
     if np.isfinite(outer) and np.isfinite(inner) and outer + inner > 0:
@@ -285,8 +221,6 @@ def analyze_one(stock, config):
         "当日涨幅%": round(pct, 2), "评分": round(score, 2),
         "日线MACD": "多头" if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]) else "偏弱",
         "日线RSI": round(drsi, 1) if np.isfinite(drsi) else None,
-        "15分钟MACD": m15_state,
-        "15分钟RSI": round(m15_rsi, 1) if np.isfinite(m15_rsi) else None,
         "MA10": round(fnum(ma10.iloc[-1]), 2),
         "MA20": round(m20, 2) if np.isfinite(m20) else None,
         "MA60": round(m60, 2) if np.isfinite(m60) else None,
@@ -303,7 +237,7 @@ def analyze_one(stock, config):
         "板块资金": "不可验证，不计入评分",
         "评分理由": "；".join(reasons),
         "风险提示": "；".join(risks) if risks else "未发现明显技术风险",
-        "数据完整性": "含15分钟数据" if intraday is not None else "缺少15分钟数据"
+        "数据完整性": "日线数据完整（关闭15分钟线防封IP）"
     }
 
 
@@ -337,7 +271,6 @@ def market_stats(snapshot):
 
 
 def load_previous():
-    """读取最近一个早于今天的 picks_YYYY-MM-DD.csv，供T+1复盘。"""
     today = now_cn().strftime("%Y-%m-%d")
     files = []
     for fn in os.listdir(REPORT_DIR):
@@ -489,7 +422,6 @@ def run():
     snapshot = get_market_snapshot(CONFIG)
     stats = market_stats(snapshot)
 
-    # 基础过滤：不设置成交额门槛；不强制最低评分。
     screen = []
     for s in snapshot:
         code, name = s["code"], s["name"]
@@ -543,7 +475,6 @@ def run():
 
     picks = df.head(3).copy() if not df.empty else pd.DataFrame()
 
-    # 保存完整候选名单和前三名，供次日复盘。
     if not df.empty:
         df.to_csv(
             os.path.join(REPORT_DIR, f"candidates_{day}.csv"),
