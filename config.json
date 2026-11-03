@@ -1,5 +1,5 @@
 {
-  "version": "overnight-scalping-v1",
+  "version": "overnight-scalp-v3-15m",
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
@@ -10,56 +10,63 @@
     "exclude_delisting": true
   },
   "data_source": {
-    "realtime_primary": "tencent",
-    "realtime_fallback": "sina",
-    "history_source": "tencent",
+    "primary": "sina",
+    "history": "tencent",
+    "intraday": "tencent_15m",
     "max_workers": 8,
-    "tencent_batch_size": 80,
-    "sina_batch_size": 80,
-    "request_timeout_seconds": 15,
-    "retry_times": 1,
-    "minimum_snapshot_ratio": 0.65
-  },
-  "history": {
-    "history_days": 180,
-    "minimum_history_rows": 60,
-    "adjust": "qfq"
+    "request_timeout_seconds": 10
   },
   "screening": {
+    "shortlist_size": 500,
+    "top_n": 3,
     "min_price": 0,
     "max_price": 800,
-    "min_amount_yuan": 0,
-    "max_daily_loss_pct": -10,
-    "top_n": 3,
-    "min_score": 0,
-    "candidate_display_limit": 100
+    "min_day_pct": -10,
+    "exclude_limit_up": true,
+    "amount_minimum": 0,
+    "min_score": 0
   },
   "indicators": {
-    "daily_macd_fast": 12,
-    "daily_macd_slow": 26,
-    "daily_macd_signal": 9,
-    "rsi_period": 14,
-    "ma_periods": [5, 10, 20, 60],
-    "intraday_macd_period": "5m"
-  },
-  "overnight": {
-    "buy_observation_time": "14:50",
-    "sell_observation_start": "09:30",
-    "sell_observation_end": "09:40",
-    "take_profit_levels": [0.005, 0.01, 0.02],
-    "default_stop_loss_pct": 0.008,
-    "support_buffer_pct": 0.003
+    "daily_macd_role": "trend_filter_only",
+    "intraday_macd_period": "15m",
+    "intraday_rsi_period": 14,
+    "ma_periods": [
+      5,
+      10,
+      20,
+      60
+    ],
+    "support_resistance_lookback": [
+      20,
+      60
+    ]
   },
   "learning": {
     "enabled": true,
-    "review_previous_picks": true,
-    "save_candidate_history": true,
-    "save_recommendation_history": true
+    "review_previous_recommendations": true,
+    "persist_reports": true
   },
   "output": {
     "directory": "reports",
-    "save_markdown_report": true,
-    "save_csv": true,
-    "save_status_json": true
+    "save_candidates": true,
+    "save_top3": true,
+    "save_market_heat": true,
+    "save_sector_heat": true,
+    "save_learning": true,
+    "compact_report": true
+  },
+  "overnight": {
+    "entry_observation_time": "14:50",
+    "exit_observation_window": "09:30-09:40",
+    "profit_scenarios_pct": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "risk_reference_pct": 0.5,
+    "do_not_force_trade": false,
+    "minimum_take_profit_pct": 0.5,
+    "stop_loss_pct": 0.8,
+    "support_break_buffer_pct": 0.3
   }
 }
