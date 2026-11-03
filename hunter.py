@@ -201,28 +201,26 @@ def review_previous(snapshot):
         low_p = fnum(cur.get("low"))
         close_p = fnum(cur.get("price"))
         
-        # 次日表现归因分析
-        if not np.isfinite(close_p): 
-            continue
+        if not np.isfinite(close_p): continue
             
         change = (close_p / old_price - 1) * 100 if old_price > 0 else np.nan
         
         if change >= 1.0:
-            reason = f"✅ 大肉！次日大涨{change:.2f}%，冲高止盈"
+            reason = f"✅ 大肉！次日大涨 {change:.2f}%，冲高止盈。"
         elif change > 0:
-            reason = f"✅ 微利离场，次日红盘{change:.2f}%"
+            reason = f"✅ 微利离场，次日红盘 {change:.2f}%。"
         elif change > -1.5:
-            reason = f"⚪ 平盘/微亏{change:.2f}%，正常震荡，纪律离场"
+            reason = f"⚪ 平盘/微亏 {change:.2f}%，正常震荡，纪律离场。"
         else:
             # 深度归因（说明选股判断错误）
             if high_p >= tp1 and close_p < old_price:
-                reason = f"❌ 贪心被套！次日最高曾达{tp1}，但收盘跌破买入价"
+                reason = f"❌ 贪心被套！次日最高曾达 {tp1}，但收盘跌破买入价。"
             elif open_p < sl and low_p < sl:
-                reason = f"❌ 破位杀跌！直接低开跌破止损线{sl}"
+                reason = f"❌ 破位杀跌！直接低开跌破止损线 {sl}。"
             elif fnum(cur.get("change_pct"), 0) < -1.5:
-                reason = f"❌ 选股失误！跟随大盘/板块跳水，跌幅{change:.2f}%"
+                reason = f"❌ 选股失误！跟随大盘/板块跳水，跌幅 {change:.2f}%。"
             else:
-                reason = f"❌ 弱势阴跌！跌破止损线{sl}，认栽出局"
+                reason = f"❌ 弱势阴跌！跌破止损线 {sl}，认栽出局。"
 
         rows.append({
             "推荐日期": date, "代码": code, "名称": item.get("名称"),
@@ -245,33 +243,40 @@ def save_learning(review):
     review.to_csv(path, index=False, encoding="utf-8-sig")
 
 def write_report(day, stats, picks, candidates, review, source_status):
-    # 高密度 PPT 卡片式报告
+    # 强烈视觉冲击力的 PPT 风格报告
     lines = [
-        f"# 🎯 A股猎手｜隔夜超短报告 ({day})",
-        f"⏰ **时间**：{now_cn():%H:%M}　|　**市场温度**：{stats['市场情绪']} (上涨 {stats['上涨比例%']}%)",
-        f"💡 **纪律**：14:50 买入，次日 09:30-09:40 冲高即走，不格局。",
+        f"# 🎯 A股猎手｜隔夜超短报告",
+        f"🗓️ **日期**：{day}　⏰ **时间**：{now_cn():%H:%M}",
+        f"🌡️ **市场情绪**：**{stats['市场情绪']}** (全市场上涨 {stats['上涨比例%']}%)",
+        f"💡 **超短铁律**：14:50 买入，次日 **09:30-09:40 冲高即走**，只吃一夜，绝不恋战！",
+        "",
         "---",
-        "## 🏆 今日狙击目标 (按评分排序)"
+        "",
+        "## 🏆 核心狙击目标 (Top 3)"
     ]
 
     if picks.empty:
-        lines.append("> ⚠️ 今日无符合尾盘强势特征的标的，建议空仓休息。")
+        lines.append("> ⚠️ **今日无符合尾盘强势特征的标的，建议空仓休息。**")
     else:
         for i, (_, x) in enumerate(picks.iterrows(), 1):
             lines += [
-                f"### {i}️⃣ {x['名称']} ({x['代码']}) — 评分: `{x['评分']}/10`",
-                f"> 👉 **尾盘买入价**：**{x['最新价']}** 元 (涨幅 {x['当日涨幅%']}%)",
-                f"> 🎯 **次日止盈**：**{x['止盈目标1']}** (+0.5%) / **{x['止盈目标2']}** (+1.5%)",
-                f"> 🛡️ **防守底线**：跌破 **{x['止损价']}** 无条件止损！",
-                f"- 🔥 **资金逻辑**：{x['资金逻辑']}",
-                f"- ⚠️ **风险预警**：{x['风险提示']}",
-                ""
+                f"### {i}️⃣ {x['名称']} ({x['代码']})",
+                f"#### 📊 综合评分：`{x['评分']} / 10`",
+                "",
+                f"> 👉 **尾盘买入参考**：**{x['最新价']}** 元 (今日涨幅 **{x['当日涨幅%']}%**)",
+                f"> 🎯 **次日止盈计划**：第一目标 **{x['止盈目标1']}** (+0.5%) / 第二目标 **{x['止盈目标2']}** (+1.5%)",
+                f"> 🛡️ **极限防守底线**：**{x['止损价']}** 元 (跌破无条件止损)",
+                "",
+                f"* **🔥 资金逻辑**：{x['资金逻辑']}",
+                f"* **📍 支撑/压力**：支撑 {x['支撑位']} / 压力 {x['压力位']}",
+                f"* **⚠️ 风险预警**：{x['风险提示']}",
+                "",
+                "---"
             ]
 
     lines += [
-        "---",
-        "## 📊 备选候选池 (前10名)",
-        "| 代码 | 名称 | 评分 | 涨幅 | 现价 | 止盈+0.5% | 防守止损 |",
+        "## 📊 备选强势股池 (Top 10)",
+        "| 代码 | 名称 | 评分 | 涨幅 | 现价 | 建议止盈 | 防守止损 |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
     ]
     if not candidates.empty:
@@ -279,17 +284,24 @@ def write_report(day, stats, picks, candidates, review, source_status):
             lines.append(f"| {x['代码']} | {x['名称']} | **{x['评分']}** | {x['当日涨幅%']}% | {x['最新价']} | {x['止盈目标1']} | {x['止损价']} |")
     
     lines += [
+        "",
         "---",
-        f"## 🔍 上一交易日复盘 (基于 {review.iloc[0]['推荐日期'] if not review.empty else '历史'} 推荐)",
+        "",
+        f"## 🔍 上一交易日深度复盘 ({review.iloc[0]['推荐日期'] if not review.empty else '历史'})"
     ]
+    
     if review.empty:
-        lines.append("> 暂无历史战绩记录。")
+        lines.append("> 暂无可复盘的上一轮推荐（可能是首次运行）。")
     else:
         for _, x in review.iterrows():
+            # 根据涨跌决定卡片颜色（用 Emoji 模拟）
+            status_icon = "🟢" if x['T+1变化%'] >= 0 else "🔴"
             lines += [
-                f"**{x['名称']} ({x['代码']})**：昨日买入价 {x['前日买入价']} ➔ 今日收盘 {x['今日现价']} ( **{x['T+1变化%']}%** )",
-                f"- 🎯 昨日计划止盈：{x['昨日止盈目标']} / 🛡️ 计划止损：{x['昨日止损底线']}",
-                f"- 💡 **归因**：{x['复盘归因']}",
+                f"#### {status_icon} {x['名称']} ({x['代码']}) —— 收益: **{x['T+1变化%']}%**",
+                f"> **昨日买入**：`{x['前日买入价']}` 元  ➔  **今日收盘**：`{x['今日现价']}` 元",
+                f"> **昨日计划**：止盈线 `{x['昨日止盈目标']}` / 止损线 `{x['昨日止损底线']}`",
+                "",
+                f"💡 **复盘结论**：{x['复盘归因']}",
                 ""
             ]
 
