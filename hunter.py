@@ -1,2402 +1,601 @@
 # -*- coding: utf-8 -*-
-"""
-A股猎手升级版（腾讯/新浪行情接口版）
-15分钟MACD + 日线趋势 + 隔夜超短 + 历史复盘学习
-"""
-
+"""A股猎手：14:50尾盘隔夜超短线扫描与T+1复盘。"""
 import os
-import re
 import json
 import time
 import traceback
-import warnings
-import requests
-
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import akshare as ak
 import numpy as np
 import pandas as pd
+import requests
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+from data_source import (
+    get_market_snapshot, get_history,
+    get_data_source_status, reset_data_source_status
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "8"))
-TOP_N = 3
-MIN_SCORE = 0.0
-HISTORY_DAYS = 120
-
-TOP_INDUSTRY_BOARDS = 12
-TOP_CONCEPT_BOARDS = 12
+os.makedirs(REPORT_DIR, exist_ok=True)
 
 
-def load_config():
-    path = os.getenv("ASHARE_CONFIG", "config.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-CONFIG = load_config()
-
-
-def sh_now():
+def now_cn():
     return datetime.now(TZ)
 
 
-def log(message):
-    print(
-        f"[{sh_now().strftime('%H:%M:%S')}] {message}",
-        flush=True
-    )
+def log(msg):
+    print(f"[{now_cn():%H:%M:%S}] {msg}", flush=True)
 
 
-def ensure_dirs():
-    os.makedirs(REPORT_DIR, exist_ok=True)
-
-
-def safe_float(value, default=np.nan):
+def fnum(x, default=np.nan):
     try:
-        if pd.isna(value):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
         return default
 
 
-def normalize_code(value):
-    digits = re.sub(r"\D", "", str(value))
-    return digits[-6:].zfill(6) if digits else ""
-
-
-def get_col(df, candidates, default=None):
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return default
-
-
-def calculate_rsi(series, period=14):
+def rsi(series, period=14):
     delta = series.diff()
-
-    gain = (
-        delta.clip(lower=0)
-        .rolling(period, min_periods=period)
-        .mean()
-    )
-
-    loss = (
-        (-delta.clip(upper=0))
-        .rolling(period, min_periods=period)
-        .mean()
-    )
-
-    rs = gain / loss.replace(0, np.nan)
-
-    result = 100 - (100 / (1 + rs))
-
-    result = result.mask(
-        (loss == 0) & (gain > 0),
-        100
-    )
-
-    return result
+    up = delta.clip(lower=0).rolling(period).mean()
+    down = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = up / down.replace(0, np.nan)
+    out = 100 - 100 / (1 + rs)
+    out = out.mask((down == 0) & (up > 0), 100)
+    return out
 
 
-def calculate_indicators(df):
-    """
-    日线只作趋势背景：
-    MA5/10/20/60 + 日线MACD + RSI。
-    日线MACD不作为尾盘触发信号。
-    """
-
-    if df is None or df.empty:
-        return None
-
-    df = df.copy()
-
-    close_col = get_col(
-        df,
-        ["close", "收盘"]
-    )
-
-    if not close_col:
-        return None
-
-    df[close_col] = pd.to_numeric(
-        df[close_col],
-        errors="coerce"
-    )
-
-    df = (
-        df.dropna(subset=[close_col])
-        .sort_index()
-        .reset_index(drop=True)
-    )
-
-    if len(df) < 60:
-        return None
-
-    close = df[close_col]
-
-    df["_close"] = close
-
-    for n in (5, 10, 20, 60):
-        df[f"MA{n}"] = close.rolling(n).mean()
-
-    ema12 = close.ewm(
-        span=12,
-        adjust=False
-    ).mean()
-
-    ema26 = close.ewm(
-        span=26,
-        adjust=False
-    ).mean()
-
-    df["DIF"] = ema12 - ema26
-
-    df["DEA"] = df["DIF"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
-
-    df["MACD"] = 2 * (
-        df["DIF"] - df["DEA"]
-    )
-
-    df["RSI"] = calculate_rsi(
-        close,
-        14
-    )
-
-    high_col = get_col(
-        df,
-        ["high", "最高"]
-    )
-
-    low_col = get_col(
-        df,
-        ["low", "最低"]
-    )
-
-    open_col = get_col(
-        df,
-        ["open", "开盘"]
-    )
-
-    vol_col = get_col(
-        df,
-        ["volume", "成交量"]
-    )
-
-    if high_col:
-        df["_high"] = pd.to_numeric(
-            df[high_col],
-            errors="coerce"
-        )
-
-    if low_col:
-        df["_low"] = pd.to_numeric(
-            df[low_col],
-            errors="coerce"
-        )
-
-    if open_col:
-        df["_open"] = pd.to_numeric(
-            df[open_col],
-            errors="coerce"
-        )
-
-    if vol_col:
-        df["_volume"] = pd.to_numeric(
-            df[vol_col],
-            errors="coerce"
-        )
-
-    return df
+def macd(series):
+    dif = series.ewm(span=12, adjust=False).mean() - series.ewm(span=26, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = 2 * (dif - dea)
+    return dif, dea, hist
 
 
-def fetch_intraday_15m(code):
-    """
-    获取腾讯15分钟K线。
-
-    使用腾讯 newfqkline 接口。
-    失败时返回None，不用日线冒充分钟数据。
-    """
-
-    code = normalize_code(code)
-
-    market = (
-        "sh"
-        if code.startswith(("6", "9"))
-        else "sz"
-    )
-
-    symbol = f"{market}{code}"
-
-    url = (
-        "https://proxy.finance.qq.com/"
-        "ifzqgtimg/appstock/app/newfqkline/get"
-    )
-
-    params = {
-        "param": f"{symbol},m15,,,160,qfq"
-    }
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://finance.qq.com/"
-    }
-
+def get_15m(code):
+    """腾讯15分钟K线。获取失败返回None，不用日线数据冒充分时。"""
+    symbol = ("sh" if code.startswith(("6", "9")) else "sz") + code
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     try:
-        resp = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=12
+        r = requests.get(
+            url, params={"param": f"{symbol},m15,,,120,qfq"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
         )
-
-        resp.raise_for_status()
-
-        payload = resp.json()
-
-        node = (
-            payload
-            .get("data", {})
-            .get(symbol, {})
-        )
-
-        rows = (
-            node.get("m15")
-            or node.get("qfq_m15")
-            or []
-        )
-
-        if not rows:
-            log(
-                f"{code} 腾讯15分钟接口未返回K线"
-            )
+        r.raise_for_status()
+        node = r.json().get("data", {}).get(symbol, {})
+        rows = node.get("m15") or node.get("qfq_m15") or []
+        if len(rows) < 30:
             return None
-
-        # 腾讯分钟K线：
-        # 时间、开盘、收盘、最高、最低、成交量
-
         df = pd.DataFrame(rows)
-
-        if df.shape[1] < 6:
-            log(
-                f"{code} 腾讯15分钟K线字段不足"
-            )
-            return None
-
         df = df.iloc[:, :6]
-
-        df.columns = [
-            "时间",
-            "开盘",
-            "收盘",
-            "最高",
-            "最低",
-            "成交量"
-        ]
-
-        for col in [
-            "开盘",
-            "收盘",
-            "最高",
-            "最低",
-            "成交量"
-        ]:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
-        df = (
-            df.dropna(subset=["收盘"])
-            .reset_index(drop=True)
-        )
-
+        df.columns = ["date", "open", "close", "high", "low", "volume"]
+        for c in ["open", "close", "high", "low", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["close"])
         if len(df) < 30:
-            log(
-                f"{code} 腾讯15分钟K线不足30根，"
-                f"实际{len(df)}根"
-            )
             return None
-
-        close = df["收盘"]
-
-        dif = (
-            close.ewm(
-                span=12,
-                adjust=False
-            ).mean()
-            -
-            close.ewm(
-                span=26,
-                adjust=False
-            ).mean()
-        )
-
-        dea = dif.ewm(
-            span=9,
-            adjust=False
-        ).mean()
-
-        df["DIF"] = dif
-        df["DEA"] = dea
-
-        df["MACD"] = 2 * (
-            dif - dea
-        )
-
-        df["RSI15"] = calculate_rsi(
-            close,
-            14
-        )
-
+        df["DIF"], df["DEA"], df["MACD"] = macd(df["close"])
+        df["RSI"] = rsi(df["close"], 14)
         return df
-
     except Exception as exc:
-        log(
-            f"{code} 腾讯15分钟数据不可用："
-            f"{type(exc).__name__}: {exc}"
-        )
+        log(f"{code} 15分钟数据不可用：{exc}")
         return None
 
 
-def market_temperature(snapshot):
-    """
-    根据全市场行情快照计算市场热度。
-    不把涨幅、成交额伪装成主力资金净流入。
-    """
+def limit_rate(code, name):
+    name = str(name).upper()
+    if "ST" in name:
+        return 5.0
+    if code.startswith(("300", "301", "688", "689")):
+        return 20.0
+    return 10.0
 
-    df = snapshot.copy()
 
-    pct = pd.to_numeric(
-        df.get("涨跌幅"),
-        errors="coerce"
-    )
+def support_resistance(hist, price):
+    """用近10/20/60日高低点及MA20/MA60估算支撑压力。"""
+    low_col = hist["low"]
+    high_col = hist["high"]
+    ma20 = fnum(hist["close"].rolling(20).mean().iloc[-1])
+    ma60 = fnum(hist["close"].rolling(60).mean().iloc[-1])
 
-    amount = pd.to_numeric(
-        df.get("成交额"),
-        errors="coerce"
-    )
+    lows = [
+        fnum(low_col.tail(10).min()),
+        fnum(low_col.tail(20).min()),
+        fnum(low_col.tail(60).min()),
+        ma20, ma60
+    ]
+    highs = [
+        fnum(high_col.tail(10).max()),
+        fnum(high_col.tail(20).max()),
+        fnum(high_col.tail(60).max())
+    ]
 
-    valid = pct.dropna()
+    supports = sorted([x for x in lows if np.isfinite(x) and 0 < x <= price])
+    resistances = sorted([x for x in highs if np.isfinite(x) and x >= price])
 
-    if valid.empty:
-        return {
-            "上涨家数": 0,
-            "下跌家数": 0,
-            "平盘家数": 0,
-            "上涨比例": 0,
-            "跌停附近": 0,
-            "涨停附近": 0,
-            "成交额亿元": None,
-            "热度": "数据不足"
-        }
+    support = supports[-1] if supports else np.nan
+    resistance = resistances[0] if resistances else np.nan
+    return support, resistance, ma20, ma60
 
-    up = int((valid > 0).sum())
-    down = int((valid < 0).sum())
-    flat = int((valid == 0).sum())
 
-    up_limit = int(
-        (valid >= 9.5).sum()
-    )
+def analyze_one(stock, config):
+    code = str(stock["code"])
+    name = str(stock["name"])
+    price = fnum(stock.get("price"))
+    pct = fnum(stock.get("change_pct"))
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(pct):
+        return None
 
-    down_limit = int(
-        (valid <= -9.5).sum()
-    )
+    if price > float(config["screening"]["max_price"]):
+        return None
+    if pct <= -10:
+        return None
+    limit = limit_rate(code, name)
+    if pct >= limit - 0.2:
+        return None
 
-    breadth = up / max(1, len(valid))
+    hist = get_history(code, config)
+    close = hist["close"]
+    if len(hist) < 60:
+        return None
 
-    total_amount = float(
-        amount.fillna(0).sum() / 1e8
-    )
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    dif, dea, mh = macd(close)
+    day_rsi = rsi(close, 14)
 
-    if (
-        breadth >= 0.65
-        and up_limit >= 50
-        and down_limit <= 10
-    ):
+    support, resistance, m20, m60 = support_resistance(hist, price)
+    deviation20 = (price / m20 - 1) * 100 if m20 > 0 else np.nan
+
+    # 15分钟动能。
+    intraday = get_15m(code)
+    m15_state = "分钟数据缺失"
+    m15_rsi = np.nan
+    m15_macd_up = False
+    m15_score = 0.0
+
+    if intraday is not None and len(intraday) >= 30:
+        a = intraday.iloc[-1]
+        b = intraday.iloc[-2]
+        m15_rsi = fnum(a["RSI"])
+        m15_macd_up = fnum(a["MACD"]) > fnum(b["MACD"])
+
+        if fnum(a["DIF"]) > fnum(a["DEA"]) and m15_macd_up:
+            m15_score += 1.4
+            m15_state = "15分钟MACD偏强"
+        elif fnum(a["DIF"]) > fnum(a["DEA"]):
+            m15_score += 0.8
+            m15_state = "15分钟MACD多头"
+        else:
+            m15_state = "15分钟动能偏弱"
+
+        if 48 <= m15_rsi <= 68:
+            m15_score += 0.6
+        elif m15_rsi > 78:
+            m15_score -= 0.5
+
+    # 10分制隔夜评分。
+    score = 0.0
+    reasons, risks = [], []
+
+    if price > fnum(ma10.iloc[-1]) and fnum(ma10.iloc[-1]) >= fnum(ma10.iloc[-2]):
+        score += 1.0
+        reasons.append("价格站上MA10且MA10走平向上")
+    elif price > fnum(ma20.iloc[-1]):
+        score += 0.5
+        reasons.append("价格仍在MA20上方")
+    else:
+        risks.append("价格位于MA20下方")
+
+    if fnum(ma20.iloc[-1]) >= fnum(ma20.iloc[-3]):
+        score += 0.5
+        reasons.append("MA20趋势未明显走弱")
+
+    if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]):
+        score += 0.7
+        reasons.append("日线MACD处于多头状态")
+    elif fnum(mh.iloc[-1]) > fnum(mh.iloc[-2]):
+        score += 0.4
+        reasons.append("日线MACD柱体改善")
+    else:
+        risks.append("日线MACD动能偏弱")
+
+    drsi = fnum(day_rsi.iloc[-1])
+    if 45 <= drsi <= 68:
+        score += 0.6
+        reasons.append("日线RSI处于适中区间")
+    elif drsi > 78:
+        risks.append("日线RSI过热")
+
+    score += m15_score
+    if m15_state != "分钟数据缺失":
+        reasons.append(m15_state)
+    else:
+        risks.append("缺少15分钟数据，尾盘时机判断不完整")
+
+    # 当日涨幅适中，避免追高。
+    if 0.2 <= pct <= 3.5:
+        score += 0.7
+        reasons.append("当日涨幅适中")
+    elif -1.0 <= pct < 0.2 and price >= fnum(ma20.iloc[-1]):
+        score += 0.4
+        reasons.append("强势趋势内小幅整理")
+    elif pct > 5:
+        risks.append("当日涨幅偏大，隔夜追高风险")
+
+    support_gap = (price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan
+    resistance_gap = (resistance / price - 1) * 100 if np.isfinite(resistance) and price > 0 else np.nan
+
+    if np.isfinite(support_gap) and 0 <= support_gap <= 3:
+        score += 0.8
+        reasons.append("价格靠近近端支撑区域")
+    elif np.isfinite(support_gap) and support_gap > 7:
+        risks.append("距离下方支撑较远")
+
+    if np.isfinite(resistance_gap) and resistance_gap <= 1.2:
+        score -= 0.6
+        risks.append("上方压力位较近，突破空间有限")
+    elif np.isfinite(resistance_gap) and resistance_gap >= 2.5:
+        score += 0.5
+        reasons.append("上方有一定空间")
+
+    # 量价。
+    volume = fnum(hist["volume"].iloc[-1])
+    avg_volume = fnum(hist["volume"].tail(5).mean())
+    volume_ratio = volume / avg_volume if avg_volume > 0 else np.nan
+    if np.isfinite(volume_ratio) and 1.05 <= volume_ratio <= 2.5:
+        score += 0.5
+        reasons.append("近期成交量有温和活跃")
+    elif np.isfinite(volume_ratio) and volume_ratio > 4:
+        risks.append("成交量异常放大，注意分歧")
+
+    # 市场数据的委比/内外盘可能不存在，缺失不加分。
+    outer = fnum(stock.get("outer"))
+    inner = fnum(stock.get("inner"))
+    if np.isfinite(outer) and np.isfinite(inner) and outer + inner > 0:
+        if outer > inner:
+            score += 0.3
+            reasons.append("外盘成交暂时强于内盘")
+        else:
+            risks.append("内盘成交暂时偏强")
+
+    score = max(0, min(10, score))
+
+    tp05 = round(price * 1.005, 2)
+    tp1 = round(price * 1.01, 2)
+    tp2 = round(price * 1.02, 2)
+
+    stop_default = price * 0.992
+    stop_support = support * 0.997 if np.isfinite(support) and support > 0 else np.nan
+    stop = max(stop_default, stop_support) if np.isfinite(stop_support) else stop_default
+    stop = round(stop, 2)
+
+    if stop >= price:
+        stop = round(stop_default, 2)
+
+    return {
+        "代码": code, "名称": name, "最新价": round(price, 2),
+        "当日涨幅%": round(pct, 2), "评分": round(score, 2),
+        "日线MACD": "多头" if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]) else "偏弱",
+        "日线RSI": round(drsi, 1) if np.isfinite(drsi) else None,
+        "15分钟MACD": m15_state,
+        "15分钟RSI": round(m15_rsi, 1) if np.isfinite(m15_rsi) else None,
+        "MA10": round(fnum(ma10.iloc[-1]), 2),
+        "MA20": round(m20, 2) if np.isfinite(m20) else None,
+        "MA60": round(m60, 2) if np.isfinite(m60) else None,
+        "支撑位": round(support, 2) if np.isfinite(support) else None,
+        "压力位": round(resistance, 2) if np.isfinite(resistance) else None,
+        "距离支撑%": round(support_gap, 2) if np.isfinite(support_gap) else None,
+        "距离压力%": round(resistance_gap, 2) if np.isfinite(resistance_gap) else None,
+        "最低止盈价+0.5%": tp05,
+        "止盈价+1%": tp1,
+        "止盈价+2%": tp2,
+        "参考止损价": stop,
+        "量比代理": round(volume_ratio, 2) if np.isfinite(volume_ratio) else None,
+        "板块": "当前数据源未提供可靠行业映射",
+        "板块资金": "不可验证，不计入评分",
+        "评分理由": "；".join(reasons),
+        "风险提示": "；".join(risks) if risks else "未发现明显技术风险",
+        "数据完整性": "含15分钟数据" if intraday is not None else "缺少15分钟数据"
+    }
+
+
+def market_stats(snapshot):
+    df = pd.DataFrame(snapshot)
+    pct = pd.to_numeric(df["change_pct"], errors="coerce")
+    up = int((pct > 0).sum())
+    down = int((pct < 0).sum())
+    flat = int((pct == 0).sum())
+    up_limit = int((pct >= 9.5).sum())
+    down_limit = int((pct <= -9.5).sum())
+    breadth = up / max(1, len(pct.dropna()))
+    amount = pd.to_numeric(df["amount"], errors="coerce").sum(min_count=1)
+
+    if breadth >= .65 and down_limit < 15:
         mood = "偏热"
-
-    elif (
-        breadth >= 0.52
-        and down > 0
-        and down_limit <= 20
-    ):
+    elif breadth >= .52 and down_limit < 25:
         mood = "温和偏强"
-
-    elif (
-        breadth <= 0.35
-        or down_limit >= 30
-    ):
+    elif breadth <= .35 or down_limit >= 30:
         mood = "偏冷"
-
     else:
         mood = "分化"
 
     return {
-        "上涨家数": up,
-        "下跌家数": down,
-        "平盘家数": flat,
-        "上涨比例": round(
-            breadth * 100,
-            1
-        ),
-        "涨停附近": up_limit,
-        "跌停附近": down_limit,
-        "成交额亿元": round(
-            total_amount,
-            1
-        ),
-        "热度": mood
+        "总数": len(df), "上涨": up, "下跌": down, "平盘": flat,
+        "涨停附近": up_limit, "跌停附近": down_limit,
+        "上涨比例%": round(breadth * 100, 1),
+        "成交额亿元": round(amount / 1e8, 1) if pd.notna(amount) else None,
+        "市场热度": mood
     }
 
 
-def build_sector_heat(snapshot):
-    """
-    如果行情快照含行业字段，
-    按行业平均涨幅、上涨比例、成交额计算板块热度。
-
-    当前接口没有可靠的行业主力净流入字段，
-    因此明确标注资金净流入不可验证。
-    """
-
-    if "行业" not in snapshot.columns:
-        return (
-            pd.DataFrame(),
-            "行情快照未提供行业字段，板块热度不可计算"
-        )
-
-    df = snapshot.copy()
-
-    df["涨跌幅"] = pd.to_numeric(
-        df.get("涨跌幅"),
-        errors="coerce"
-    )
-
-    df["成交额"] = pd.to_numeric(
-        df.get("成交额"),
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=["行业", "涨跌幅"]
-    )
-
-    if df.empty:
-        return (
-            pd.DataFrame(),
-            "行业字段无有效数据"
-        )
-
-    grouped = df.groupby("行业").agg(
-        股票数=("代码", "count"),
-        平均涨幅=("涨跌幅", "mean"),
-        上涨家数=(
-            "涨跌幅",
-            lambda x: int((x > 0).sum())
-        ),
-        成交额亿元=(
-            "成交额",
-            lambda x: float(
-                x.fillna(0).sum() / 1e8
-            )
-        )
-    ).reset_index()
-
-    grouped["上涨比例"] = (
-        grouped["上涨家数"]
-        / grouped["股票数"]
-        * 100
-    )
-
-    grouped = grouped.sort_values(
-        [
-            "平均涨幅",
-            "上涨比例",
-            "成交额亿元"
-        ],
-        ascending=False
-    ).head(15)
-
-    grouped["资金净流入"] = (
-        "当前数据源未提供，不能确认"
-    )
-
-    return (
-        grouped,
-        "板块热度为行业涨幅/广度/成交额代理，"
-        "不等于主力资金净流入"
-    )
-
-
-def fetch_board_flow():
-    status = {
-        "行业资金净流入": "当前数据源未提供，不能确认",
-        "概念资金净流入": "当前数据源未提供，不能确认"
-    }
-
-    boards = pd.DataFrame(
-        columns=[
-            "板块类型",
-            "板块名称",
-            "资金流排名",
-            "资金流值",
-            "板块涨幅%"
-        ]
-    )
-
-    return boards, {}, status
-
-
-def load_previous_picks(today):
-    ensure_dirs()
-
-    candidates = []
-
-    run_dir = os.path.join(
-        REPORT_DIR,
-        "runs"
-    )
-
-    if os.path.isdir(run_dir):
-        for filename in os.listdir(run_dir):
-
-            match = re.fullmatch(
-                r"(\d{4}-\d{2}-\d{2})_(\d{6})\.csv",
-                filename
-            )
-
-            if match and match.group(1) < today:
-                candidates.append(
-                    (
-                        match.group(1) + " " + match.group(2),
-                        os.path.join(run_dir, filename)
-                    )
-                )
-
-    if candidates:
-        stamp, path = sorted(
-            candidates,
-            reverse=True
-        )[0]
-
-        try:
-            df = pd.read_csv(
-                path,
-                dtype={"代码": str}
-            )
-
-            if (
-                not df.empty
-                and "代码" in df.columns
-            ):
-                df["代码"] = (
-                    df["代码"].map(normalize_code)
-                )
-
-            return stamp, df
-
-        except Exception as exc:
-            log(
-                f"读取上次运行快照失败：{exc}"
-            )
-
-    daily = []
-
-    for filename in os.listdir(REPORT_DIR):
-
-        if re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}\.csv",
-            filename
-        ):
-            date_text = filename[:-4]
-
-            if date_text < today:
-                daily.append(
-                    (
-                        date_text,
-                        os.path.join(
-                            REPORT_DIR,
-                            filename
-                        )
-                    )
-                )
-
-    if not daily:
+def load_previous():
+    """读取最近一个早于今天的 picks_YYYY-MM-DD.csv，供T+1复盘。"""
+    today = now_cn().strftime("%Y-%m-%d")
+    files = []
+    for fn in os.listdir(REPORT_DIR):
+        match = re.fullmatch(r"picks_(\d{4}-\d{2}-\d{2})\.csv", fn)
+        if match and match.group(1) < today:
+            files.append((match.group(1), fn))
+    if not files:
         return None, pd.DataFrame()
 
-    prev_date, path = sorted(
-        daily,
-        reverse=True
-    )[0]
-
+    previous_date, fn = sorted(files)[-1]
     try:
-        df = pd.read_csv(
-            path,
-            dtype={"代码": str}
-        )
-
-        if (
-            not df.empty
-            and "代码" in df.columns
-        ):
-            df["代码"] = (
-                df["代码"].map(normalize_code)
-            )
-
-        return prev_date, df
-
+        old = pd.read_csv(os.path.join(REPORT_DIR, fn), dtype={"代码": str})
+        return previous_date, old
     except Exception as exc:
-        log(
-            f"读取上次推荐文件失败：{exc}"
-        )
-        return prev_date, pd.DataFrame()
+        log(f"读取上一轮推荐失败：{exc}")
+        return None, pd.DataFrame()
 
 
-def learning_paths():
-    return {
-        "outcomes": os.path.join(
-            REPORT_DIR,
-            "learning_outcomes.csv"
-        ),
-        "memory": os.path.join(
-            REPORT_DIR,
-            "learning_memory.json"
-        ),
-        "rules": os.path.join(
-            REPORT_DIR,
-            "learned_rules.json"
-        )
-    }
+def review_previous(snapshot):
+    date, old = load_previous()
+    if old.empty:
+        return date, pd.DataFrame()
 
+    current = {x["code"]: x for x in snapshot}
+    rows = []
 
-def read_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(
-                path,
-                "r",
-                encoding="utf-8"
-            ) as f:
-                return json.load(f)
-
-    except Exception as exc:
-        log(
-            f"读取学习文件失败 {path}: {exc}"
-        )
-
-    return default
-def diagnose_drop(old, current_price, current_pct, market_pct=None):
-    reasons = []
-
-    old_price = safe_float(old.get("最新价"))
-    old_rsi = safe_float(old.get("RSI"))
-    old_dev = safe_float(old.get("偏离MA10%"))
-    old_turnover = safe_float(old.get("换手率"))
-    old_volume = safe_float(old.get("量比"))
-    old_macd = safe_float(old.get("MACD"))
-    old_pct = safe_float(
-        old.get("涨幅%", old.get("涨跌幅"))
-    )
-
-    change = (
-        (current_price / old_price - 1) * 100
-        if old_price > 0 and current_price > 0
-        else np.nan
-    )
-
-    if np.isfinite(change) and change <= -2:
-        if (
-            market_pct is not None
-            and pd.notna(market_pct)
-            and market_pct <= -1
-        ):
-            reasons.append("市场整体走弱")
-
-        if np.isfinite(old_rsi) and old_rsi >= 70:
-            reasons.append("入选时RSI偏高")
-
-        if np.isfinite(old_dev) and old_dev >= 5:
-            reasons.append("入选时明显偏离MA10")
-
-        if np.isfinite(old_turnover) and old_turnover >= 15:
-            reasons.append("入选时换手率偏高")
-
-        if np.isfinite(old_volume) and old_volume >= 3:
-            reasons.append("入选时量比偏高")
-
-        if np.isfinite(old_macd) and old_macd < 0:
-            reasons.append("入选时MACD仍在零轴下方")
-
-        if np.isfinite(old_pct) and old_pct >= 5:
-            reasons.append("入选当日涨幅较大")
-
-        if not reasons:
-            reasons.append("已确认价格走弱，需进一步核对公告")
-
-    elif np.isfinite(change) and change < 0:
-        reasons.append("小幅回撤")
-
-    elif np.isfinite(change):
-        reasons.append("未出现下跌型失误")
-
-    else:
-        reasons.append("价格数据不完整")
-
-    return change, "；".join(reasons)
-
-
-def update_learning(previous_date, previous_df, current_spot, today):
-    paths = learning_paths()
-    outcomes_path = paths["outcomes"]
-
-    if previous_df is None or previous_df.empty:
-        return pd.DataFrame(), ["没有上一交易日推荐记录"]
-
-    snap = current_spot.copy()
-    snap["纯代码"] = snap["代码"].map(normalize_code)
-    snap = snap.drop_duplicates("纯代码").set_index("纯代码")
-
-    outcome_rows = []
-
-    for _, old in previous_df.iterrows():
-        code = normalize_code(old.get("代码", ""))
-
-        if not code or code not in snap.index:
+    for _, item in old.iterrows():
+        code = str(item.get("代码", "")).zfill(6)
+        cur = current.get(code)
+        if not cur:
             continue
 
-        current = snap.loc[code]
-
-        current_price = safe_float(current.get("最新价"))
-        current_pct = safe_float(current.get("涨跌幅"))
-        old_price = safe_float(old.get("最新价"))
-
-        change, diagnosis = diagnose_drop(
-            old,
-            current_price,
-            current_pct
-        )
+        old_price = fnum(item.get("最新价"))
+        new_price = fnum(cur.get("price"))
+        change = (new_price / old_price - 1) * 100 if old_price > 0 and new_price > 0 else np.nan
 
         if not np.isfinite(change):
-            continue
+            reason = "价格数据不完整"
+        elif change <= -2:
+            reason = "明显下跌：需检查市场环境、板块走弱、支撑失守及尾盘追高"
+        elif change < 0:
+            reason = "小幅回撤：观察支撑位和开盘承接"
+        else:
+            reason = "价格未下跌，记录正向样本"
 
-        outcome_rows.append({
-            "推荐日期": str(previous_date).split(" ")[0],
-            "复盘日期": today,
-            "代码": code,
-            "名称": str(old.get("名称", "")),
-            "入选评分": safe_float(old.get("评分")),
-            "入选价": old_price,
-            "复盘价": current_price,
-            "T1收益%": round(change, 3),
-            "是否下跌": int(change < 0),
-            "是否明显下跌": int(change <= -2),
-            "RSI区间": (
-                "偏热"
-                if safe_float(old.get("RSI")) >= 70
-                else "非偏热"
-            ),
-            "乖离区间": (
-                "高乖离"
-                if safe_float(old.get("偏离MA10%")) >= 5
-                else "普通乖离"
-            ),
-            "量比区间": (
-                "高量比"
-                if safe_float(old.get("量比")) >= 3
-                else "普通量比"
-            ),
-            "换手区间": (
-                "高换手"
-                if safe_float(old.get("换手率")) >= 15
-                else "普通换手"
-            ),
-            "MACD区间": (
-                "零轴下"
-                if safe_float(old.get("MACD")) < 0
-                else "零轴上"
-            ),
-            "下跌归因候选": diagnosis
+        rows.append({
+            "推荐日期": date, "代码": code, "名称": item.get("名称"),
+            "前日参考价": old_price, "当前价": new_price,
+            "T+1变化%": round(change, 2) if np.isfinite(change) else None,
+            "复盘结论": reason,
+            "前日评分": item.get("评分"),
+            "前日风险提示": item.get("风险提示")
         })
 
-    if not outcome_rows:
-        return pd.DataFrame(), ["未匹配到有效价格"]
+    return date, pd.DataFrame(rows)
 
-    new_df = pd.DataFrame(outcome_rows)
 
-    if os.path.exists(outcomes_path):
+def save_learning(review):
+    if review.empty:
+        return
+
+    path = os.path.join(REPORT_DIR, "overnight_learning.csv")
+    if os.path.exists(path):
         try:
-            old_df = pd.read_csv(
-                outcomes_path,
-                dtype={"代码": str}
-            )
-            new_df = pd.concat(
-                [old_df, new_df],
-                ignore_index=True
-            )
+            old = pd.read_csv(path, dtype={"代码": str})
+            review = pd.concat([old, review], ignore_index=True)
         except Exception:
             pass
 
-    new_df["代码"] = new_df["代码"].map(normalize_code)
+    review = review.drop_duplicates(["推荐日期", "代码"], keep="last")
+    review.to_csv(path, index=False, encoding="utf-8-sig")
 
-    new_df = new_df.drop_duplicates(
-        ["推荐日期", "复盘日期", "代码"],
-        keep="last"
-    )
 
-    new_df.to_csv(
-        outcomes_path,
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    feature_cols = [
-        "RSI区间",
-        "乖离区间",
-        "量比区间",
-        "换手区间",
-        "MACD区间"
-    ]
-
-    rules = {
-        "说明": "根据历史推荐T+1结果统计",
-        "规则": {}
-    }
-
-    for col in feature_cols:
-        for bucket, group in new_df.groupby(
-            col,
-            dropna=False
-        ):
-            if len(group) < 8:
-                continue
-
-            returns = pd.to_numeric(
-                group["T1收益%"],
-                errors="coerce"
-            )
-
-            loss_rate = float(
-                (returns <= -2).mean()
-            )
-
-            avg_return = float(
-                returns.mean()
-            )
-
-            penalty = (
-                min(
-                    1.0,
-                    max(0.0, (loss_rate - 0.40) * 2.0)
-                )
-                if avg_return < 0
-                else 0.0
-            )
-
-            rules["规则"][f"{col}={bucket}"] = {
-                "样本数": int(len(group)),
-                "明显下跌率": round(loss_rate, 3),
-                "平均T1收益%": round(avg_return, 3),
-                "建议扣分": round(penalty, 2)
-            }
-
-    with open(
-        paths["rules"],
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            rules,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    memory = read_json(
-        paths["memory"],
-        {
-            "累计复盘次数": 0,
-            "累计样本数": 0,
-            "最近复盘日期": None,
-            "经验摘要": []
-        }
-    )
-
-    memory["累计复盘次数"] = (
-        int(memory.get("累计复盘次数", 0)) + 1
-    )
-
-    memory["累计样本数"] = int(len(new_df))
-    memory["最近复盘日期"] = today
-
-    drops = new_df[
-        pd.to_numeric(
-            new_df["T1收益%"],
-            errors="coerce"
-        ) <= -2
-    ]
-
-    summary = (
-        f"截至{today}累计{len(new_df)}条T+1样本；"
-        f"明显下跌样本{len(drops)}条。"
-    )
-
-    memory.setdefault("经验摘要", []).append(summary)
-    memory["经验摘要"] = memory["经验摘要"][-30:]
-
-    with open(
-        paths["memory"],
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            memory,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    notes = [
-        f"已更新学习样本：本轮新增{len(outcome_rows)}条，累计{len(new_df)}条。"
-    ]
-
-    return new_df, notes
-
-
-def apply_learned_penalties(candidates):
-    paths = learning_paths()
-
-    rules = read_json(
-        paths["rules"],
-        {}
-    ).get("规则", {})
-
-    if not rules or not candidates:
-        return candidates
-
-    for item in candidates:
-        features = {
-            "RSI区间": (
-                "偏热"
-                if safe_float(item.get("RSI")) >= 70
-                else "非偏热"
-            ),
-            "乖离区间": (
-                "高乖离"
-                if safe_float(item.get("偏离MA10%")) >= 5
-                else "普通乖离"
-            ),
-            "量比区间": (
-                "高量比"
-                if safe_float(item.get("量比")) >= 3
-                else "普通量比"
-            ),
-            "换手区间": (
-                "高换手"
-                if safe_float(item.get("换手率")) >= 15
-                else "普通换手"
-            ),
-            "MACD区间": (
-                "零轴下"
-                if safe_float(item.get("MACD")) < 0
-                else "零轴上"
-            )
-        }
-
-        penalty = 0.0
-        warnings_found = []
-
-        for col, bucket in features.items():
-            rule = rules.get(
-                f"{col}={bucket}",
-                {}
-            )
-
-            p = safe_float(
-                rule.get("建议扣分"),
-                0.0
-            )
-
-            if p > 0:
-                penalty += p
-                warnings_found.append(
-                    f"历史学习提示：{col}={bucket}"
-                )
-
-        penalty = min(1.5, penalty)
-
-        item["学习扣分"] = round(penalty, 2)
-
-        if penalty:
-            item["评分"] = round(
-                max(
-                    0.0,
-                    safe_float(item.get("评分"), 0.0) - penalty
-                ),
-                2
-            )
-
-            existing = str(
-                item.get("风险提示", "")
-            )
-
-            item["风险提示"] = "；".join(
-                x
-                for x in [
-                    existing,
-                    *warnings_found
-                ]
-                if x and x != "未触发主要风险项"
-            )
-
-    return candidates
-
-
-def fetch_hist(code, today_compact):
-    symbol_tx = (
-        f"sh{code}"
-        if code.startswith("6")
-        else f"sz{code}"
-    )
-
-    start_date = (
-        sh_now() - timedelta(days=HISTORY_DAYS)
-    ).strftime("%Y%m%d")
-
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            hist = ak.stock_zh_a_hist_tx(
-                symbol=symbol_tx,
-                start_date=start_date,
-                end_date=today_compact,
-                adjust="qfq"
-            )
-
-            if hist is not None and len(hist) >= 60:
-                return hist
-
-            last_error = RuntimeError(
-                "历史行情为空或不足60条"
-            )
-
-        except Exception as exc:
-            last_error = exc
-
-        if attempt < 2:
-            time.sleep(0.5)
-
-    raise RuntimeError(
-        f"历史行情获取失败：{last_error}"
-    )
-
-
-def process_single_stock(row, today_compact, board_map=None):
-    raw_code = str(row.get("代码", ""))
-    code = normalize_code(raw_code)
-    name = str(row.get("名称", ""))
-
-    if not code or "ST" in name.upper() or "退" in name:
-        return None
-
-    try:
-        hist_raw = fetch_hist(
-            code,
-            today_compact
-        )
-
-        hist = calculate_indicators(hist_raw)
-
-        if hist is None or len(hist) < 60:
-            raise RuntimeError("日线历史不足60根")
-
-        last = hist.iloc[-1]
-        prev = hist.iloc[-2]
-
-        price = safe_float(row.get("最新价"))
-        pct = safe_float(row.get("涨跌幅"))
-
-        if (
-            not np.isfinite(price)
-            or price <= 0
-            or not np.isfinite(pct)
-        ):
-            return None
-
-        ma5 = safe_float(last.get("MA5"))
-        ma10 = safe_float(last.get("MA10"))
-        ma20 = safe_float(last.get("MA20"))
-        ma60 = safe_float(last.get("MA60"))
-
-        daily_macd = safe_float(last.get("MACD"))
-        daily_rsi = safe_float(last.get("RSI"))
-
-        volume_ratio = safe_float(
-            row.get("量比"),
-            0.0
-        )
-
-        turnover = safe_float(
-            row.get("换手率")
-        )
-
-        amount = safe_float(
-            row.get("成交额")
-        )
-
-        high_col = get_col(
-            hist,
-            ["_high"]
-        )
-
-        low_col = get_col(
-            hist,
-            ["_low"]
-        )
-
-        low20 = (
-            hist[low_col].tail(20).min()
-            if low_col
-            else np.nan
-        )
-
-        high20 = (
-            hist[high_col].tail(20).max()
-            if high_col
-            else np.nan
-        )
-
-        low60 = (
-            hist[low_col].tail(60).min()
-            if low_col
-            else np.nan
-        )
-
-        high60 = (
-            hist[high_col].tail(60).max()
-            if high_col
-            else np.nan
-        )
-
-        support = max(
-            [
-                x
-                for x in [low20, ma20, ma60, low60]
-                if np.isfinite(x) and x < price
-            ],
-            default=np.nan
-        )
-
-        resistance = min(
-            [
-                x
-                for x in [high20, high60]
-                if np.isfinite(x) and x > price
-            ],
-            default=np.nan
-        )
-
-        support_dist = (
-            (price / support - 1) * 100
-            if np.isfinite(support) and support > 0
-            else np.nan
-        )
-
-        resistance_dist = (
-            (resistance / price - 1) * 100
-            if np.isfinite(resistance) and price > 0
-            else np.nan
-        )
-
-        # 15分钟MACD/RSI用于尾盘节奏；
-        # 日线MACD只判断大方向。
-        intraday = fetch_intraday_15m(code)
-
-        m15_macd = np.nan
-        m15_prev = np.nan
-        m15_dif = np.nan
-        m15_dea = np.nan
-        m15_rsi = np.nan
-
-        m15_volume_trend = "分钟数据不可用"
-
-        if intraday is not None and len(intraday) >= 3:
-            ilast = intraday.iloc[-1]
-            iprev = intraday.iloc[-2]
-
-            m15_macd = safe_float(
-                ilast.get("MACD")
-            )
-
-            m15_prev = safe_float(
-                iprev.get("MACD")
-            )
-
-            m15_dif = safe_float(
-                ilast.get("DIF")
-            )
-
-            m15_dea = safe_float(
-                ilast.get("DEA")
-            )
-
-            m15_rsi = safe_float(
-                ilast.get("RSI15")
-            )
-
-            v = pd.to_numeric(
-                intraday["成交量"].tail(6),
-                errors="coerce"
-            )
-
-            if (
-                len(v) >= 6
-                and v.iloc[-3:].mean() > v.iloc[:3].mean()
-            ):
-                m15_volume_trend = "尾盘量能增强"
-
-            elif len(v) >= 6:
-                m15_volume_trend = "尾盘量能平稳/减弱"
-
-        score = 0.0
-        reasons = []
-        risks = []
-
-        if (
-            np.isfinite(m15_macd)
-            and np.isfinite(m15_prev)
-        ):
-            if m15_macd > m15_prev:
-                score += 1.1
-                reasons.append("15分钟MACD改善")
-            else:
-                risks.append("15分钟MACD走弱")
-
-            if (
-                np.isfinite(m15_dif)
-                and np.isfinite(m15_dea)
-                and m15_dif > m15_dea
-            ):
-                score += 0.7
-                reasons.append("15分钟MACD处于多头")
-            else:
-                risks.append("15分钟MACD未形成多头")
-
-        else:
-            risks.append(
-                "缺少15分钟数据，尾盘信号不完整"
-            )
-
-        if np.isfinite(m15_rsi):
-            if 48 <= m15_rsi <= 68:
-                score += 0.8
-                reasons.append("15分钟RSI强度适中")
-
-            elif 42 <= m15_rsi < 48:
-                score += 0.35
-
-            elif m15_rsi >= 78:
-                risks.append("15分钟RSI过热")
-
-        else:
-            risks.append("15分钟RSI不可用")
-
-        if price >= ma5 and price >= ma10:
-            score += 0.8
-            reasons.append("价格站在MA5/MA10上方")
-
-        elif price >= ma20:
-            score += 0.35
-
-        else:
-            risks.append("价格低于MA20")
-
-        if (
-            np.isfinite(ma20)
-            and np.isfinite(ma60)
-            and ma20 >= ma60
-        ):
-            score += 0.6
-            reasons.append("MA20在MA60上方")
-        else:
-            risks.append("日线中期趋势偏弱")
-
-        if np.isfinite(daily_macd) and daily_macd > 0:
-            score += 0.45
-            reasons.append("日线MACD在零轴上方")
-
-        elif (
-            np.isfinite(daily_macd)
-            and daily_macd > safe_float(prev.get("MACD"), -999)
-        ):
-            score += 0.25
-            reasons.append("日线MACD边际改善")
-
-        if np.isfinite(daily_rsi) and 45 <= daily_rsi <= 70:
-            score += 0.35
-
-        elif np.isfinite(daily_rsi) and daily_rsi > 78:
-            risks.append("日线RSI过热")
-
-        if 0.8 <= volume_ratio <= 2.5:
-            score += 0.55
-            reasons.append("日内量比适中")
-
-        elif volume_ratio > 4:
-            risks.append("量比过高，警惕尾盘分歧")
-
-        if 0 <= pct <= 3.5:
-            score += 0.45
-            reasons.append("当日涨幅不过度")
-
-        elif pct > 6:
-            risks.append("当日涨幅过大，隔夜追高风险")
-
-        if np.isfinite(turnover) and 1.5 <= turnover <= 12:
-            score += 0.3
-
-        elif np.isfinite(turnover) and turnover > 20:
-            risks.append("换手率异常偏高")
-
-        if np.isfinite(support_dist):
-            if 0 <= support_dist <= 3.0:
-                score += 0.65
-                reasons.append("靠近20/60日支撑区")
-
-            elif support_dist > 8:
-                risks.append("距离下方支撑较远")
-
-        if np.isfinite(resistance_dist):
-            if resistance_dist <= 1.2:
-                risks.append("临近20/60日压力位，突破空间有限")
-
-            elif resistance_dist >= 2.5:
-                score += 0.45
-                reasons.append("上方短期压力空间尚可")
-
-        if (
-            np.isfinite(support_dist)
-            and support_dist <= 2.0
-            and m15_volume_trend == "尾盘量能增强"
-        ):
-            score += 0.35
-            reasons.append("支撑附近出现量能增强")
-
-        if m15_volume_trend == "尾盘量能增强":
-            score += 0.25
-
-        # 主板10%，创业板/科创板20%
-        limit_pct = (
-            20.0
-            if code.startswith(("300", "301", "688", "689"))
-            else 10.0
-        )
-
-        if pct <= -10.0 or pct >= limit_pct - 0.15:
-            return None
-
-        if price > 800:
-            return None
-
-        for risk, penalty in [
-            ("15分钟MACD走弱", 0.6),
-            ("15分钟MACD未形成多头", 0.4),
-            ("15分钟RSI过热", 0.5),
-            ("价格低于MA20", 0.6),
-            ("日线中期趋势偏弱", 0.4),
-            ("当日涨幅过大，隔夜追高风险", 0.8),
-            ("量比过高，警惕尾盘分歧", 0.5),
-            ("换手率异常偏高", 0.4),
-            ("临近20/60日压力位，突破空间有限", 0.8),
-            ("距离下方支撑较远", 0.3),
-            ("缺少15分钟数据，尾盘信号不完整", 0.8)
-        ]:
-            if risk in risks:
-                score -= penalty
-
-        score = max(
-            0.0,
-            min(10.0, score)
-        )
-
-        # 隔夜收益目标仅为情景参考，不承诺盈利。
-        target_05 = round(price * 1.005, 3)
-        target_10 = round(price * 1.010, 3)
-        target_20 = round(price * 1.020, 3)
-        stop_05 = round(price * 0.995, 3)
-
-        overnight_cfg = CONFIG.get(
-            "overnight",
-            {}
-        )
-
-        min_take_profit_pct = float(
-            overnight_cfg.get(
-                "minimum_take_profit_pct",
-                0.5
-            )
-        )
-
-        stop_loss_pct = abs(
-            float(
-                overnight_cfg.get(
-                    "stop_loss_pct",
-                    0.8
-                )
-            )
-        )
-
-        take_profit_min = round(
-            price * (1 + min_take_profit_pct / 100),
-            3
-        )
-
-        fixed_stop = price * (
-            1 - stop_loss_pct / 100
-        )
-
-        support_stop = (
-            support
-            * (
-                1
-                - float(
-                    overnight_cfg.get(
-                        "support_break_buffer_pct",
-                        0.3
-                    )
-                ) / 100
-            )
-            if np.isfinite(support)
-            else np.nan
-        )
-
-        stop_loss_price = (
-            max(fixed_stop, support_stop)
-            if np.isfinite(support_stop)
-            else fixed_stop
-        )
-
-        stop_loss_price = min(
-            stop_loss_price,
-            price * 0.999
-        )
-
-        stop_loss_price = round(
-            stop_loss_price,
-            3
-        )
-
-        risk_reward_pct = (
-            (take_profit_min / price - 1) * 100
-            /
-            max(
-                0.01,
-                (1 - stop_loss_price / price) * 100
-            )
-        )
-
-        return {
-            "代码": code,
-            "名称": name,
-            "行业": str(row.get("行业", "未知")),
-            "最新价": round(price, 3),
-            "涨幅%": round(pct, 2),
-            "成交额": (
-                round(amount, 0)
-                if np.isfinite(amount)
-                else np.nan
-            ),
-            "换手率": (
-                round(turnover, 2)
-                if np.isfinite(turnover)
-                else np.nan
-            ),
-            "量比": round(volume_ratio, 2),
-            "日线MACD": (
-                round(daily_macd, 4)
-                if np.isfinite(daily_macd)
-                else np.nan
-            ),
-            "日线RSI": (
-                round(daily_rsi, 1)
-                if np.isfinite(daily_rsi)
-                else np.nan
-            ),
-            "15分钟MACD": (
-                round(m15_macd, 4)
-                if np.isfinite(m15_macd)
-                else np.nan
-            ),
-            "15分钟RSI": (
-                round(m15_rsi, 1)
-                if np.isfinite(m15_rsi)
-                else np.nan
-            ),
-            "尾盘量能": m15_volume_trend,
-            "支撑位": (
-                round(support, 3)
-                if np.isfinite(support)
-                else np.nan
-            ),
-            "压力位": (
-                round(resistance, 3)
-                if np.isfinite(resistance)
-                else np.nan
-            ),
-            "距支撑%": (
-                round(support_dist, 2)
-                if np.isfinite(support_dist)
-                else np.nan
-            ),
-            "距压力%": (
-                round(resistance_dist, 2)
-                if np.isfinite(resistance_dist)
-                else np.nan
-            ),
-            "评分": round(score, 2),
-            "评分理由": (
-                "；".join(reasons[:5])
-                or "综合指标评分"
-            ),
-            "风险提示": (
-                "；".join(risks)
-                if risks
-                else "未触发主要风险项"
-            ),
-            "次日+0.5%参考价": target_05,
-            "次日+1%参考价": target_10,
-            "次日+2%参考价": target_20,
-            "回撤0.5%观察价": stop_05,
-            "最低止盈价": take_profit_min,
-            "参考止损价": stop_loss_price,
-            "最低止盈幅度%": round(
-                min_take_profit_pct,
-                2
-            ),
-            "参考止损幅度%": round(
-                (price / stop_loss_price - 1) * 100,
-                2
-            ),
-            "预估盈亏比": round(
-                risk_reward_pct,
-                2
-            ),
-            "历史K线日期": str(
-                last.get(
-                    get_col(
-                        hist,
-                        ["date", "日期"],
-                        hist.columns[0]
-                    )
-                )
-            )[:10]
-        }
-
-    except Exception as exc:
-        return {
-            "_error": (
-                f"{code} {name}: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-            "_code": code
-        }
-
-
-def build_fallback_candidates(spot, existing, top_n=3):
-    """
-    深度行情失败时，用实时快照补足排名。
-    缺失指标明确标记，不伪造技术数据。
-    """
-
-    existing_codes = {
-        normalize_code(x.get("代码"))
-        for x in existing
-    }
-
-    fallback_rows = []
-
-    for _, row in spot.iterrows():
-        code = normalize_code(row.get("代码"))
-
-        if not code or code in existing_codes:
-            continue
-
-        price = safe_float(row.get("最新价"))
-        pct = safe_float(row.get("涨跌幅"))
-
-        if (
-            not np.isfinite(price)
-            or price <= 0
-            or price > 800
-            or not np.isfinite(pct)
-        ):
-            continue
-
-        if pct <= -10:
-            continue
-
-        limit_pct = (
-            20.0
-            if code.startswith(("300", "301", "688", "689"))
-            else 10.0
-        )
-
-        if pct >= limit_pct - 0.15:
-            continue
-
-        volume_ratio = safe_float(
-            row.get("量比"),
-            0.0
-        )
-
-        turnover = safe_float(
-            row.get("换手率"),
-            np.nan
-        )
-
-        score = 0.5
-
-        reasons = [
-            "实时快照可用，但历史/分钟指标未能完整取得"
-        ]
-
-        risks = [
-            "技术指标数据不完整，排名仅作备选观察，不宜直接下单"
-        ]
-
-        if 0.3 <= pct <= 3.0:
-            score += 0.8
-            reasons.append("当日涨幅温和")
-
-        elif pct > 5:
-            risks.append("当日涨幅偏大，隔夜追高风险")
-            score -= 0.4
-
-        if 0.8 <= volume_ratio <= 2.5:
-            score += 0.4
-            reasons.append("实时量比适中")
-
-        elif volume_ratio > 4:
-            score -= 0.3
-            risks.append("量比偏高")
-
-        if np.isfinite(turnover) and 1.5 <= turnover <= 12:
-            score += 0.2
-
-        score = max(
-            0.0,
-            min(10.0, score)
-        )
-
-        fallback_rows.append({
-            "代码": code,
-            "名称": str(row.get("名称", "")),
-            "行业": str(row.get("行业", "未知")),
-            "最新价": round(price, 3),
-            "涨幅%": round(pct, 2),
-            "成交额": safe_float(row.get("成交额")),
-            "换手率": turnover,
-            "量比": volume_ratio,
-            "日线MACD": np.nan,
-            "日线RSI": np.nan,
-            "15分钟MACD": np.nan,
-            "15分钟RSI": np.nan,
-            "尾盘量能": "分钟数据不可用",
-            "支撑位": np.nan,
-            "压力位": np.nan,
-            "距支撑%": np.nan,
-            "距压力%": np.nan,
-            "评分": round(score, 2),
-            "评分理由": "；".join(reasons),
-            "风险提示": "；".join(risks),
-            "次日+0.5%参考价": round(price * 1.005, 3),
-            "次日+1%参考价": round(price * 1.01, 3),
-            "次日+2%参考价": round(price * 1.02, 3),
-            "回撤0.5%观察价": round(price * 0.995, 3),
-            "最低止盈价": round(price * 1.005, 3),
-            "参考止损价": round(price * 0.992, 3),
-            "最低止盈幅度%": 0.5,
-            "参考止损幅度%": 0.8,
-            "预估盈亏比": 0.625,
-            "历史K线日期": "未取得"
-        })
-
-    fallback_rows.sort(
-        key=lambda x: (
-            x["评分"],
-            safe_float(x.get("量比"), 0)
-        ),
-        reverse=True
-    )
-
-    return fallback_rows[:max(0, top_n - len(existing))]
-## 二、hunter.py（第3段）
-
-这是最后一段。**接在第2段代码后面**，直到文件结束。
-
-```python
-def write_report(
-    today,
-    candidates_df,
-    result,
-    previous_date,
-    review_df,
-    board_df,
-    statuses,
-    scan_stats,
-    market_stats,
-    sector_df,
-    sector_status
-):
-    """输出简洁卡片式Markdown报告。"""
-
-    ensure_dirs()
-
+def write_report(day, stats, picks, candidates, review, source_status):
     lines = [
         "# A股猎手｜隔夜超短报告",
-        (
-            f"> {today}  ·  扫描时间 "
-            f"{sh_now().strftime('%H:%M:%S')}  ·  "
-            "策略：14:50观察买入 / 次日9:30—9:40观察卖出"
-        ),
+        f"**日期：{day}　运行时间：{now_cn():%H:%M}**",
         "",
-        "## 市场温度",
-        (
-            f"**{market_stats.get('热度', '未知')}**　"
-            f"上涨 {market_stats.get('上涨家数', 0)} 家 / "
-            f"下跌 {market_stats.get('下跌家数', 0)} 家　"
-            f"｜上涨比例 {market_stats.get('上涨比例', 0)}%"
-        ),
-        (
-            f"涨停附近 {market_stats.get('涨停附近', 0)}　"
-            f"·　跌停附近 {market_stats.get('跌停附近', 0)}　"
-            f"·　两市成交额约 "
-            f"{market_stats.get('成交额亿元', '未知')} 亿元"
-        ),
+        "## 01｜市场温度",
+        f"**{stats['市场热度']}**　上涨 {stats['上涨']} 家 / 下跌 {stats['下跌']} 家 / 平盘 {stats['平盘']} 家",
+        f"涨停附近 {stats['涨停附近']} 家　跌停附近 {stats['跌停附近']} 家　上涨比例 {stats['上涨比例%']}%",
+        f"两市成交额估算：{stats['成交额亿元']} 亿元",
         "",
-        "## 今日板块热度 TOP",
-        (
-            f"> {sector_status}；不能把板块成交额/涨幅代理"
-            "误称为主力净流入。"
-        )
+        "## 02｜数据质量",
+        f"股票列表：{source_status.get('universe_count')} 只；实时行情：{source_status.get('snapshot_count')} 只",
+        f"腾讯行情：{source_status.get('tencent_count')} 只；新浪补充：{source_status.get('sina_count')} 只",
+        "行业资金净流入、概念资金流及政策新闻：当前数据接口未接入，报告不虚构相关结论。",
+        "",
+        "## 03｜隔夜综合排名前三",
+        "买入参考：14:50附近；次日卖出观察：9:30—9:40。止盈止损是参考价，不保证成交。"
     ]
 
-    if sector_df is not None and not sector_df.empty:
-        lines.append(
-            "|行业|平均涨幅|上涨比例|成交额(亿元)|资金净流入|"
-        )
-        lines.append(
-            "|---|---:|---:|---:|---|"
-        )
+    if picks.empty:
+        lines.append("本轮没有取得有效技术分析结果。")
+    else:
+        for i, (_, x) in enumerate(picks.iterrows(), 1):
+            lines += [
+                "",
+                f"### {i}. {x['名称']}（{x['代码']}）　**{x['评分']}/10分**",
+                f"- 参考买入价：**{x['最新价']}元**",
+                f"- 止盈：**{x['最低止盈价+0.5%']} / {x['止盈价+1%']} / {x['止盈价+2%']}元**",
+                f"- 参考止损：**{x['参考止损价']}元**",
+                f"- 支撑：{x['支撑位']}元　压力：{x['压力位']}元",
+                f"- 技术理由：{x['评分理由']}",
+                f"- 风险：{x['风险提示']}",
+                f"- 分时数据：{x['数据完整性']}；板块资金：{x['板块资金']}"
+            ]
 
-        for _, r in sector_df.head(8).iterrows():
+    lines += ["", "## 04｜候选名单", f"本轮有效分析候选：{len(candidates)}只"]
+
+    if not candidates.empty:
+        lines.append("|排名|代码|名称|评分|涨幅|止盈+0.5%|止损|")
+        lines.append("|---:|---|---|---:|---:|---:|---:|")
+        for i, (_, x) in enumerate(candidates.head(30).iterrows(), 1):
             lines.append(
-                f"|{r['行业']}|"
-                f"{r['平均涨幅']:.2f}%|"
-                f"{r['上涨比例']:.1f}%|"
-                f"{r['成交额亿元']:.1f}|"
-                "未取得可靠数据|"
+                f"|{i}|{x['代码']}|{x['名称']}|{x['评分']}|{x['当日涨幅%']}%|"
+                f"{x['最低止盈价+0.5%']}|{x['参考止损价']}|"
             )
+
+    lines += ["", "## 05｜上一轮复盘"]
+
+    if review.empty:
+        lines.append("暂无可复盘的上一轮推荐。")
     else:
-        lines.append(
-            "- 当前快照未提供可用行业分类，板块热度无法计算。"
-        )
-
-    lines.extend([
-        "",
-        "## 最强3只｜隔夜观察",
-        ""
-    ])
-
-    if result is None or result.empty:
-        lines.append(
-            "符合硬性条件的实时行情不足，"
-            "或行情快照不可用；不生成虚假股票。"
-        )
-
-    else:
-        for i, item in enumerate(
-            result.to_dict("records"),
-            1
-        ):
-            lines.extend([
-                (
-                    f"### {i}. **{item['名称']}（{item['代码']}）**"
-                    f"　<small>评分 {item['评分']}/10</small>"
-                ),
-                (
-                    f"- 观察价 **{item['最新价']}**　"
-                    f"｜当日 **{item['涨幅%']:+.2f}%**　"
-                    f"｜行业 **{item.get('行业', '未知')}**"
-                ),
-                (
-                    f"- **入选原因：** "
-                    f"{item.get('评分理由', '暂无')}"
-                ),
-                (
-                    f"- **支撑/压力：** "
-                    f"{item.get('支撑位', '—')} / "
-                    f"{item.get('压力位', '—')}　"
-                    f"｜距支撑 {item.get('距支撑%', '—')}%　"
-                    f"｜距压力 {item.get('距压力%', '—')}%"
-                ),
-                (
-                    f"- **尾盘信号：** "
-                    f"15分钟MACD {item.get('15分钟MACD', '—')}；"
-                    f"15分钟RSI {item.get('15分钟RSI', '—')}；"
-                    f"{item.get('尾盘量能', '—')}"
-                ),
-                (
-                    f"- **最低止盈价：** "
-                    f"{item.get('最低止盈价', '—')} "
-                    f"（约 +{item.get('最低止盈幅度%', 0.5)}%）"
-                    f"　｜**参考止损价：** "
-                    f"{item.get('参考止损价', '—')} "
-                    f"（约 -{item.get('参考止损幅度%', 0.8)}%）"
-                ),
-                (
-                    f"- **备选止盈价：** "
-                    f"+1% {item.get('次日+1%参考价', '—')} "
-                    f"/ +2% {item.get('次日+2%参考价', '—')} "
-                    f"｜预估盈亏比 {item.get('预估盈亏比', '—')}"
-                ),
-                (
-                    f"- **风险：** "
-                    f"{item.get('风险提示', '无')}"
-                ),
-                ""
-            ])
-
-    lines.extend([
-        "## 候选名单",
-        ""
-    ])
-
-    if candidates_df is not None and not candidates_df.empty:
-        lines.append(
-            "|排名|代码|名称|评分|当日涨幅|15分钟MACD|"
-            "15分钟RSI|支撑|压力|行业|"
-        )
-        lines.append(
-            "|---:|---|---|---:|---:|---:|---:|---:|---:|---|"
-        )
-
-        for i, r in enumerate(
-            candidates_df.head(50).to_dict("records"),
-            1
-        ):
+        for _, x in review.iterrows():
             lines.append(
-                f"|{i}|{r.get('代码')}|{r.get('名称')}|"
-                f"{r.get('评分')}|{r.get('涨幅%')}%|"
-                f"{r.get('15分钟MACD')}|"
-                f"{r.get('15分钟RSI')}|"
-                f"{r.get('支撑位')}|{r.get('压力位')}|"
-                f"{r.get('行业', '未知')}|"
+                f"- {x['名称']}（{x['代码']}）：T+1变化 {x['T+1变化%']}%；"
+                f"{x['复盘结论']}。原风险：{x.get('前日风险提示', '')}"
             )
 
-    else:
-        lines.append("暂无候选。")
+    lines += [
+        "", "## 06｜交易纪律",
+        "- 0.5%/1%/2%为毛收益目标，需扣除佣金、印花税和滑点。",
+        "- 次日若高开冲高，可按计划分批兑现；若低开跌破支撑，不应机械等待止盈。",
+        "- A股T+1，买入当日不能卖出；跳空时止损价可能无法成交。",
+        "- 本报告是量化筛选参考，不保证盈利，也不构成投资承诺。"
+    ]
 
-    lines.extend([
-        "",
-        "## 上一轮复盘",
-        ""
-    ])
-
-    if previous_date and review_df is not None and not review_df.empty:
-        lines.append(
-            f"上次记录：{previous_date}"
-        )
-
-        for _, r in review_df.iterrows():
-            chg = r.get("相对上次价格变化%")
-
-            chg_text = (
-                f"{chg:+.2f}%"
-                if pd.notna(chg)
-                else "无法计算"
-            )
-
-            lines.append(
-                f"- {r.get('名称')}（{r.get('代码')}）："
-                f"{chg_text}；{r.get('复盘判断')}；"
-                f"{r.get('下跌归因候选', '需进一步核实')}"
-            )
-
-    else:
-        lines.append(
-            "暂无可复盘的上一轮记录。"
-        )
-
-    lines.extend([
-        "",
-        "## 数据与执行提醒",
-        (
-            f"- 日线MACD只作趋势过滤；15分钟MACD/RSI用于尾盘节奏。"
-            f"历史日线成功 {scan_stats.get('success', 0)} 只，"
-            f"失败 {scan_stats.get('failed', 0)} 只。"
-        ),
-        (
-            "- 当前版本没有接入可靠的实时板块主力净流入和政策新闻源，"
-            "相关项目明确标注不可验证，不会编造。"
-        ),
-        (
-            "- 最低止盈价按参考买入价上方0.5%计算；"
-            "参考止损价默认约-0.8%，若附近有明确支撑，"
-            "则参考支撑下方0.3%的更紧止损边界。"
-            "止盈止损均非保证成交价。"
-        ),
-        (
-            "- +1%/+2%为扩展止盈参考；"
-            "需计入佣金、印花税、滑点。"
-            "次日9:30—9:40的价格需要当时行情确认。"
-        ),
-        (
-            "- A股T+1：当日买入不能当日卖出；"
-            "跳空、跌停、流动性不足可能无法按预期成交。"
-        )
-    ])
-
-    with open(
-        os.path.join(REPORT_DIR, "report.md"),
-        "w",
-        encoding="utf-8"
-    ) as f:
+    with open(os.path.join(REPORT_DIR, "report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 
-def scan_market():
-    started = time.time()
+def run():
+    start = time.time()
+    day = now_cn().strftime("%Y-%m-%d")
 
-    ensure_dirs()
+    reset_data_source_status()
+    log("获取全市场实时行情……")
+    snapshot = get_market_snapshot(CONFIG)
+    stats = market_stats(snapshot)
 
-    now = sh_now()
-    today = now.strftime("%Y-%m-%d")
-    today_compact = now.strftime("%Y%m%d")
+    # 基础过滤：不设置成交额门槛；不强制最低评分。
+    screen = []
+    for s in snapshot:
+        code, name = s["code"], s["name"]
+        price = fnum(s.get("price"))
+        pct = fnum(s.get("change_pct"))
 
-    log("获取全市场实时快照...")
+        if not np.isfinite(price) or not np.isfinite(pct):
+            continue
+        if price <= 0 or price > float(CONFIG["screening"]["max_price"]):
+            continue
+        if pct <= -10:
+            continue
+        if pct >= limit_rate(code, name) - 0.2:
+            continue
 
-    spot, snapshot_source = get_spot_snapshot()
+        screen.append(s)
 
-    spot_all = spot.copy()
+    log(f"硬性过滤后：{len(screen)}只，开始技术分析。")
 
-    required = [
-        "代码",
-        "名称",
-        "最新价",
-        "涨跌幅"
-    ]
+    workers = int(CONFIG.get("data_source", {}).get("max_workers", 8))
+    analyzed, errors = [], []
 
-    missing = [
-        col
-        for col in required
-        if col not in spot.columns
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"实时快照缺少必要字段：{missing}"
-        )
-
-    spot["纯代码"] = spot["代码"].map(
-        normalize_code
-    )
-
-    for col in [
-        "最新价",
-        "涨跌幅",
-        "成交额",
-        "量比",
-        "委比",
-        "外盘",
-        "内盘",
-        "换手率"
-    ]:
-        if col not in spot.columns:
-            spot[col] = np.nan
-
-        spot[col] = pd.to_numeric(
-            spot[col],
-            errors="coerce"
-        )
-
-    code = spot["纯代码"].astype(str)
-    name = spot["名称"].astype(str)
-
-    # 沪深主板、创业板、科创板；排除北交所、ST、退市
-    is_sz_sh = code.str.match(
-        r"^(000|001|002|003|300|301|600|601|603|605|688|689)"
-    )
-
-    limit_pct = np.where(
-        code.str.startswith(
-            ("300", "301", "688", "689")
-        ),
-        20.0,
-        10.0
-    )
-
-    spot = spot[
-        is_sz_sh
-        & (~name.str.contains(
-            r"ST|退",
-            case=False,
-            na=False
-        ))
-        & (spot["最新价"] > 0)
-        & (spot["最新价"] <= 800)
-        & (spot["涨跌幅"] > -10.0)
-        & (spot["涨跌幅"] < (limit_pct - 0.15))
-    ].copy()
-
-    # 不设成交额准入门槛。
-    # 按成交额排序，只让前500只进入深度分析，
-    # 避免全市场逐只请求分钟K线。
-    spot["_amount_sort"] = (
-        spot["成交额"].fillna(0)
-    )
-
-    max_candidates = int(
-        CONFIG.get(
-            "screening",
-            {}
-        ).get(
-            "shortlist_size",
-            500
-        )
-    )
-
-    spot = (
-        spot.sort_values(
-            "_amount_sort",
-            ascending=False
-        )
-        .head(max_candidates)
-        .drop(columns=["_amount_sort"])
-    )
-
-    log(
-        f"基础过滤后进入深度分析：{len(spot)} 只"
-        "（无成交额准入门槛）"
-    )
-
-    market_stats = market_temperature(
-        spot_all
-    )
-
-    sector_df, sector_status = build_sector_heat(
-        spot_all
-    )
-
-    previous_date, previous_df = load_previous_picks(
-        today
-    )
-
-    review_df, review_notes = review_previous_picks(
-        previous_date,
-        previous_df,
-        spot_all
-    )
-
-    learning_df, learning_notes = update_learning(
-        previous_date,
-        previous_df,
-        spot_all,
-        today
-    )
-
-    candidates = []
-    errors = []
-
-    total = len(spot)
-    success = 0
-    failed = 0
-
-    log(
-        f"开始隔夜超短评分；并发数={MAX_WORKERS}"
-    )
-
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            executor.submit(
-                process_single_stock,
-                row,
-                today_compact,
-                None
-            ): row
-            for _, row in spot.iterrows()
+            pool.submit(analyze_one, s, CONFIG): s
+            for s in screen
         }
 
-        completed = 0
-
-        for future in as_completed(futures):
-            completed += 1
-
+        for i, future in enumerate(as_completed(futures), 1):
             try:
-                res = future.result()
-
-                if res and "_error" in res:
-                    failed += 1
-
-                    errors.append({
-                        "时间": sh_now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                        "错误": res["_error"]
-                    })
-
-                elif res:
-                    success += 1
-                    candidates.append(res)
-
+                item = future.result()
+                if item:
+                    analyzed.append(item)
             except Exception as exc:
-                failed += 1
-                row = futures[future]
-
                 errors.append({
-                    "时间": sh_now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    "错误": (
-                        f"{row.get('代码')} "
-                        f"{row.get('名称')}: {exc}"
-                    )
+                    "代码": futures[future]["code"],
+                    "名称": futures[future]["name"],
+                    "错误": str(exc)[:300]
                 })
 
-            if completed % 50 == 0 or completed == total:
-                log(
-                    f"进度：{completed}/{total}；"
-                    f"有效候选 {len(candidates)}；"
-                    f"失败 {failed}"
-                )
+            if i % 200 == 0 or i == len(futures):
+                log(f"进度 {i}/{len(futures)}，有效分析 {len(analyzed)}")
 
-    error_path = os.path.join(
-        REPORT_DIR,
-        "scan_errors.csv"
-    )
+    df = pd.DataFrame(analyzed)
+
+    if not df.empty:
+        df = df.sort_values(
+            ["评分", "当日涨幅%"],
+            ascending=[False, False]
+        ).reset_index(drop=True)
+
+    picks = df.head(3).copy() if not df.empty else pd.DataFrame()
+
+    # 保存完整候选名单和前三名，供次日复盘。
+    if not df.empty:
+        df.to_csv(
+            os.path.join(REPORT_DIR, f"candidates_{day}.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+
+    if not picks.empty:
+        picks.to_csv(
+            os.path.join(REPORT_DIR, f"picks_{day}.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+
+    prev_date, review = review_previous(snapshot)
+    save_learning(review)
 
     if errors:
         pd.DataFrame(errors).to_csv(
-            error_path,
+            os.path.join(REPORT_DIR, "scan_errors.csv"),
             mode="a",
-            header=not os.path.exists(error_path),
+            header=not os.path.exists(os.path.join(REPORT_DIR, "scan_errors.csv")),
             index=False,
             encoding="utf-8-sig"
         )
 
-    top_n = int(
-        CONFIG.get(
-            "screening",
-            {}
-        ).get(
-            "top_n",
-            3
-        )
-    )
+    source_status = get_data_source_status()
+    write_report(day, stats, picks, df, review, source_status)
 
-    if candidates:
-        candidates = apply_learned_penalties(
-            candidates
-        )
-
-    fallback_candidates = build_fallback_candidates(
-        spot,
-        candidates,
-        top_n=top_n
-    )
-
-    candidates.extend(
-        fallback_candidates
-    )
-
-    if candidates:
-        df_all = pd.DataFrame(
-            candidates
-        ).sort_values(
-            ["评分", "量比"],
-            ascending=[False, False]
-        )
-
-        result = df_all.head(
-            top_n
-        ).copy()
-
-        df_all.to_csv(
-            os.path.join(
-                REPORT_DIR,
-                f"candidates_{today}.csv"
-            ),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-        result.to_csv(
-            os.path.join(
-                REPORT_DIR,
-                f"{today}.csv"
-            ),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-        history_path = os.path.join(
-            REPORT_DIR,
-            "recommendation_history.csv"
-        )
-
-        history = result.copy()
-
-        history.insert(
-            0,
-            "推荐日期",
-            today
-        )
-
-        if os.path.exists(history_path):
-            try:
-                old_hist = pd.read_csv(
-                    history_path,
-                    dtype={"代码": str}
-                )
-
-                history = pd.concat(
-                    [old_hist, history],
-                    ignore_index=True
-                )
-
-                history["代码"] = (
-                    history["代码"].map(normalize_code)
-                )
-
-                history = history.drop_duplicates(
-                    ["推荐日期", "代码"],
-                    keep="last"
-                )
-
-            except Exception:
-                pass
-
-        history.to_csv(
-            history_path,
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-    else:
-        df_all = pd.DataFrame()
-        result = pd.DataFrame()
-
-        pd.DataFrame(
-            columns=["代码", "名称", "评分"]
-        ).to_csv(
-            os.path.join(
-                REPORT_DIR,
-                f"candidates_{today}.csv"
-            ),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-        pd.DataFrame(
-            columns=["代码", "名称", "评分"]
-        ).to_csv(
-            os.path.join(
-                REPORT_DIR,
-                f"{today}.csv"
-            ),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-    if sector_df is not None and not sector_df.empty:
-        sector_df.to_csv(
-            os.path.join(
-                REPORT_DIR,
-                f"sector_heat_{today}.csv"
-            ),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-    stats = {
-        "snapshot_source": snapshot_source,
-        "universe": total,
-        "success": success,
-        "failed": failed,
-        "seconds": round(
-            time.time() - started,
-            1
-        )
+    status = {
+        "date": day,
+        "market": stats,
+        "candidate_count": len(df),
+        "pick_count": len(picks),
+        "errors": len(errors),
+        "seconds": round(time.time() - start, 1),
+        "data_source": source_status
     }
 
-    empty_boards = pd.DataFrame()
+    with open(os.path.join(REPORT_DIR, "status.json"), "w", encoding="utf-8") as f:
+        json.dump(status, f, ensure_ascii=False, indent=2)
 
-    write_report(
-        today,
-        df_all,
-        result,
-        previous_date,
-        review_df,
-        empty_boards,
-        {
-            "行业": sector_status,
-            "资金": "净流入数据不可用"
-        },
-        stats,
-        market_stats,
-        sector_df,
-        sector_status
-    )
-
-    log(
-        f"完成：候选 {len(df_all)}，"
-        f"前三名 {len(result)}，"
-        f"失败 {failed}，"
-        f"耗时 {stats['seconds']} 秒。"
-    )
+    log(f"完成：候选{len(df)}只，前三名{len(picks)}只，错误{len(errors)}条。")
+    log("报告位置：reports/report.md")
 
 
 if __name__ == "__main__":
     try:
-        scan_market()
-
+        with open("config.json", "r", encoding="utf-8") as f:
+            CONFIG = json.load(f)
+        run()
     except Exception as exc:
-        ensure_dirs()
-
-        log(
-            f"程序运行失败：{type(exc).__name__}: {exc}"
-        )
-
+        log(f"扫描失败：{type(exc).__name__}: {exc}")
         traceback.print_exc()
-
-        with open(
-            os.path.join(
-                REPORT_DIR,
-                "fatal_error.log"
-            ),
-            "a",
-            encoding="utf-8"
-        ) as f:
-            f.write(
-                f"\n[{sh_now().isoformat()}] "
-                f"{type(exc).__name__}: {exc}\n"
-            )
-
-            f.write(
-                traceback.format_exc()
-            )
+        with open(os.path.join(REPORT_DIR, "fatal_error.log"), "a", encoding="utf-8") as f:
+            f.write(f"\n{now_cn().isoformat()} {type(exc).__name__}: {exc}\n")
+            f.write(traceback.format_exc())
+        raise
