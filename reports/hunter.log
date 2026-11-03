@@ -1,36 +1,410 @@
-2026-10-31 12:46:31,982 [INFO] ============================================================
-2026-10-31 12:46:31,982 [INFO] A股猎手开始运行
-2026-10-31 12:46:31,982 [INFO] 扫描编号：20261031_124631
-2026-10-31 12:46:31,982 [INFO] ============================================================
-2026-10-31 12:46:31,982 [INFO] 步骤1：获取沪深A股全市场行情
-2026-10-31 12:53:28,091 [INFO] ============================================================
-2026-10-31 12:53:28,091 [INFO] A股猎手开始运行
-2026-10-31 12:53:28,092 [INFO] 扫描编号：20261031_125328
-2026-10-31 12:53:28,092 [INFO] ============================================================
-2026-10-31 12:53:28,092 [INFO] 步骤1：获取沪深A股全市场行情
-2026-10-31 12:53:54,367 [ERROR] 扫描失败
-Traceback (most recent call last):
-  File "/home/runner/work/a-/a-/hunter.py", line 988, in run_hunter
-    snapshot = get_market_snapshot(config)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/runner/work/a-/a-/data_source.py", line 686, in get_market_snapshot
-    result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
-  File "/home/runner/work/a-/a-/data_source.py", line 686, in <lambda>
-    result.sort(key=lambda x: _to_float(x.get("amount"), 0) or 0, reverse=True)
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: _to_float() takes 1 positional argument but 2 were given
-2026-10-31 12:56:55,677 [INFO] ============================================================
-2026-10-31 12:56:55,677 [INFO] A股猎手开始运行
-2026-10-31 12:56:55,677 [INFO] 扫描编号：20261031_125655
-2026-10-31 12:56:55,677 [INFO] ============================================================
-2026-10-31 12:56:55,677 [INFO] 步骤1：获取沪深A股全市场行情
-2026-10-31 12:57:23,417 [INFO] 全市场有效行情数量：5025
-2026-10-31 12:57:23,418 [INFO] 步骤2：计算市场整体涨跌情况
-2026-10-31 12:57:23,422 [INFO] 市场环境：市场偏弱，上涨比例：16.24%
-2026-10-31 12:57:23,423 [INFO] 步骤3：初步筛选候选股票
-2026-10-31 12:57:23,427 [INFO] 初步筛选得到 0 只候选股票
-2026-10-31 12:57:23,427 [ERROR] 扫描失败
-Traceback (most recent call last):
-  File "/home/runner/work/a-/a-/hunter.py", line 1027, in run_hunter
-    raise RuntimeError(
-RuntimeError: 初步筛选后没有候选股票。本轮不生成虚假的前三名。
+# -*- coding: utf-8 -*-
+"""A股猎手：14:50尾盘隔夜超短线扫描（右侧顺势+左侧错杀双轨版）"""
+import os
+import json
+import time
+import traceback
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+
+from data_source import (
+    get_market_snapshot, get_history,
+    get_data_source_status, reset_data_source_status
+)
+
+TZ = ZoneInfo("Asia/Shanghai")
+REPORT_DIR = "reports"
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+def now_cn():
+    return datetime.now(TZ)
+
+def log(msg):
+    print(f"[{now_cn():%H:%M:%S}] {msg}", flush=True)
+
+def fnum(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+def rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(period).mean()
+    down = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = up / down.replace(0, np.nan)
+    out = 100 - 100 / (1 + rs)
+    out = out.mask((down == 0) & (up > 0), 100)
+    return out
+
+def macd(series):
+    dif = series.ewm(span=12, adjust=False).mean() - series.ewm(span=26, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = 2 * (dif - dea)
+    return dif, dea, hist
+
+def limit_rate(code, name):
+    name = str(name).upper()
+    if "ST" in name: return 5.0
+    if code.startswith(("300", "301", "688", "689")): return 20.0
+    return 10.0
+
+def analyze_one(stock, config):
+    code, name = str(stock["code"]), str(stock["name"])
+    price, pct = fnum(stock.get("price")), fnum(stock.get("change_pct"))
+    high, low, open_p = fnum(stock.get("high")), fnum(stock.get("low")), fnum(stock.get("open"))
+    
+    # 基础拦截：跌停、涨停、极高价
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(pct): return None
+    if price > float(config["screening"]["max_price"]): return None
+    if pct <= -9.8: return None 
+    if pct >= limit_rate(code, name) - 0.2: return None
+
+    hist = get_history(code, config)
+    if hist is None or len(hist) < 60: return None
+
+    close = hist["close"]
+    ma5, ma10, ma20, ma60 = close.rolling(5).mean(), close.rolling(10).mean(), close.rolling(20).mean(), close.rolling(60).mean()
+    dif, dea, mh = macd(close)
+    day_rsi = fnum(rsi(close, 14).iloc[-1])
+    
+    # 量能
+    volume = fnum(hist["volume"].iloc[-1])
+    avg_volume = fnum(hist["volume"].tail(5).mean())
+    volume_ratio = volume / avg_volume if avg_volume > 0 else np.nan
+
+    current_ma5, current_ma10, current_ma20, current_ma60 = fnum(ma5.iloc[-1]), fnum(ma10.iloc[-1]), fnum(ma20.iloc[-1]), fnum(ma60.iloc[-1])
+
+    # 计算日内位置
+    day_range = high - low
+    close_position = (price - low) / day_range if day_range > 0 else 0.5
+    upper_shadow = (high - max(price, open_p)) / day_range if day_range > 0 else 0.5
+
+    score = 0.0
+    reasons, risks = [], []
+    pattern_type = ""
+
+    # ================= 模式一：左侧错杀（博反弹） =================
+    if pct <= -2.0:
+        pattern_type = "左侧探底"
+        
+        # 1. 大趋势不能坏（必须在60日线附近或上方）
+        if price < current_ma60 * 0.98:
+            return None
+            
+        # 2. 必须有探底回升的下影线，说明下方有资金托底
+        if close_position < 0.5:
+            return None # 收在最低点附近，说明还在跌，不能接
+            
+        score += 3.0
+        reasons.append("深V探底回升(资金承接)")
+        
+        # 3. RSI 处于超卖或低位
+        if day_rsi <= 40:
+            score += 2.0
+            reasons.append(f"RSI超卖({day_rsi:.0f})")
+            
+        # 4. 靠近强支撑
+        if np.isfinite(current_ma20) and price >= current_ma20 * 0.98:
+            score += 2.5
+            reasons.append("回踩20日线不破")
+        elif np.isfinite(current_ma60) and price >= current_ma60:
+            score += 1.5
+            reasons.append("回踩60日线企稳")
+            
+        # 5. 缩量下跌（杀跌动能枯竭）
+        if np.isfinite(volume_ratio) and volume_ratio <= 0.9:
+            score += 1.5
+            reasons.append("缩量阴跌(抛压枯竭)")
+            
+        if pct < -6.0:
+            risks.append("跌幅较大，次日波动剧烈")
+
+    # ================= 模式二：右侧顺势（做突破） =================
+    else:
+        pattern_type = "右侧突破"
+        
+        # 1. 防诱多：必须实体阳线，不能长上影
+        if open_p > 0 and price < open_p: return None 
+        if upper_shadow > 0.4: return None 
+
+        # 2. 必须站上10日线，且10日线向上
+        if price < current_ma10: return None
+        if current_ma10 < fnum(ma10.iloc[-2]): return None
+
+        # 3. 涨幅温和
+        if 0.5 <= pct <= 4.0:
+            score += 2.5
+            reasons.append("温和起涨(未透支涨幅)")
+        elif pct > 6.0:
+            return None # 涨幅太大不要去接盘
+
+        # 4. 距离支撑位极近（跌下来容易防守）
+        support_gap = (price / current_ma10 - 1) * 100 if current_ma10 > 0 else np.nan
+        if np.isfinite(support_gap) and 0 <= support_gap <= 2.0:
+            score += 3.0
+            reasons.append("紧贴5/10日支撑")
+
+        # 5. 技术指标
+        if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]):
+            score += 1.5
+            reasons.append("MACD多头")
+        if 45 <= day_rsi <= 65:
+            score += 1.0
+            reasons.append("RSI健康")
+
+        # 6. 温和放量
+        if np.isfinite(volume_ratio) and 1.0 <= volume_ratio <= 2.5:
+            score += 1.0
+            reasons.append("量能温和放大")
+
+    score = max(0, min(10, score))
+    if score < 6.0:
+        return None
+
+    # ================= 交易计划 =================
+    tp1, tp2 = round(price * 1.005, 2), round(price * 1.015, 2)
+    
+    # 左侧模式的止损位设在今日最低点之下；右侧设在5日线之下
+    if pattern_type == "左侧探底":
+        stop_loss = round(low * 0.99, 2)
+    else:
+        stop_loss = round(max(low * 0.995, current_ma5 * 0.99), 2)
+        
+    if stop_loss >= price: stop_loss = round(price * 0.97, 2)
+
+    return {
+        "代码": code, "名称": name, "最新价": round(price, 2),
+        "当日涨幅%": round(pct, 2), "评分": round(score, 2),
+        "模式": pattern_type,
+        "止盈目标1": tp1, "止盈目标2": tp2, "止损价": stop_loss,
+        "资金逻辑": "；".join(reasons) if reasons else "无强驱动",
+        "风险提示": "；".join(risks) if risks else "无明显风险",
+    }
+
+def market_stats(snapshot):
+    df = pd.DataFrame(snapshot)
+    pct = pd.to_numeric(df["change_pct"], errors="coerce")
+    breadth = int((pct > 0).sum()) / max(1, len(pct.dropna()))
+    if breadth >= 0.6: mood = "🔥 极热"
+    elif breadth >= 0.45: mood = "🌤 温和"
+    else: mood = "❄️ 偏冷"
+    return {"上涨比例%": round(breadth * 100, 1), "市场情绪": mood}
+
+def load_previous():
+    today = now_cn().strftime("%Y-%m-%d")
+    files = []
+    for fn in os.listdir(REPORT_DIR):
+        match = re.fullmatch(r"picks_(\d{4}-\d{2}-\d{2})\.csv", fn)
+        if match and match.group(1) < today: files.append((match.group(1), fn))
+    if not files: return None, pd.DataFrame()
+    previous_date, fn = sorted(files)[-1]
+    try:
+        old = pd.read_csv(os.path.join(REPORT_DIR, fn), dtype={"代码": str})
+        return previous_date, old
+    except Exception: return None, pd.DataFrame()
+
+def review_previous(snapshot):
+    date, old = load_previous()
+    if old.empty: return date, pd.DataFrame()
+
+    current = {x["code"]: x for x in snapshot}
+    rows = []
+    for _, item in old.iterrows():
+        code = str(item.get("代码", "")).zfill(6)
+        cur = current.get(code)
+        if not cur: continue
+
+        old_price = fnum(item.get("最新价"))
+        tp1 = fnum(item.get("止盈目标1"))
+        sl = fnum(item.get("止损价"))
+        
+        open_p = fnum(cur.get("open"))
+        high_p = fnum(cur.get("high"))
+        low_p = fnum(cur.get("low"))
+        close_p = fnum(cur.get("price"))
+        
+        if not np.isfinite(close_p): continue
+            
+        change = (close_p / old_price - 1) * 100 if old_price > 0 else np.nan
+        
+        if change >= 1.0:
+            reason = f"✅ 大肉！次日大涨 {change:.2f}%，冲高止盈。"
+        elif change > 0:
+            reason = f"✅ 微利离场，次日红盘 {change:.2f}%。"
+        elif change > -1.5:
+            reason = f"⚪ 平盘/微亏 {change:.2f}%，正常震荡，纪律离场。"
+        else:
+            if high_p >= tp1 and close_p < old_price:
+                reason = f"❌ 贪心被套！次日最高曾达 {tp1}，但收盘跌破买入价。"
+            elif open_p < sl and low_p < sl:
+                reason = f"❌ 破位杀跌！直接低开跌破止损线 {sl}。"
+            else:
+                reason = f"❌ 弱势阴跌！跌破止损线 {sl}，认栽出局。"
+
+        rows.append({
+            "推荐日期": date, "代码": code, "名称": item.get("名称"),
+            "前日买入价": old_price, "今日现价": close_p,
+            "昨日止盈目标": tp1, "昨日止损底线": sl,
+            "T+1变化%": round(change, 2) if np.isfinite(change) else None,
+            "复盘归因": reason
+        })
+    return date, pd.DataFrame(rows)
+
+def save_learning(review):
+    if review.empty: return
+    path = os.path.join(REPORT_DIR, "overnight_learning.csv")
+    if os.path.exists(path):
+        try:
+            old = pd.read_csv(path, dtype={"代码": str})
+            review = pd.concat([old, review], ignore_index=True)
+        except Exception: pass
+    review = review.drop_duplicates(["推荐日期", "代码"], keep="last")
+    review.to_csv(path, index=False, encoding="utf-8-sig")
+
+def write_report(day, stats, picks, candidates, review, source_status):
+    lines = [
+        f"# 🎯 A股猎手｜隔夜超短报告 ({day})",
+        f"⏰ **时间**：{now_cn():%H:%M}　|　**市场温度**：{stats['市场情绪']} (上涨 {stats['上涨比例%']}%)",
+        f"💡 **交易纪律**：14:50 尾盘买入，次日 09:30-09:40 冲高即走，绝不恋战。",
+        "---",
+        "## 🏆 今日核心狙击目标 (左右侧双轨)"
+    ]
+
+    if picks.empty:
+        lines.append("> ⚠️ 今日无符合防守特征的标的，建议空仓休息。")
+    else:
+        for i, (_, x) in enumerate(picks.iterrows(), 1):
+            lines += [
+                f"### {i}️⃣ {x['名称']} ({x['代码']}) — 评分: `{x['评分']}/10` [{x['模式']}]",
+                f"> 👉 **尾盘买入价**：**{x['最新价']}** 元 (涨幅 {x['当日涨幅%']}%)",
+                f"> 🎯 **次日止盈**：**{x['止盈目标1']}** (+0.5%) / **{x['止盈目标2']}** (+1.5%)",
+                f"> 🛡️ **防守底线**：跌破 **{x['止损价']}** 无条件止损！",
+                f"- 🔥 **入选理由**：{x['资金逻辑']}",
+                f"- ⚠️ **风险预警**：{x['风险提示']}",
+                ""
+            ]
+
+    lines += [
+        "---",
+        "## 📊 备选强势股池 (前10名)",
+        "| 代码 | 名称 | 模式 | 评分 | 涨幅 | 现价 | 止盈+0.5% | 防守止损 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+    ]
+    if not candidates.empty:
+        for _, x in candidates.head(10).iterrows():
+            lines.append(f"| {x['代码']} | {x['名称']} | {x['模式']} | **{x['评分']}** | {x['当日涨幅%']}% | {x['最新价']} | {x['止盈目标1']} | {x['止损价']} |")
+    
+    lines += [
+        "---",
+        f"## 🔍 上一交易日复盘 (基于 {review.iloc[0]['推荐日期'] if not review.empty else '历史'} 推荐)",
+    ]
+    if review.empty:
+        lines.append("> 暂无历史战绩记录。")
+    else:
+        for _, x in review.iterrows():
+            status_icon = "🟢" if x['T+1变化%'] >= 0 else "🔴"
+            lines += [
+                f"#### {status_icon} {x['名称']} ({x['代码']}) —— 收益: **{x['T+1变化%']}%**",
+                f"> **昨日买入**：`{x['前日买入价']}` 元  ➔  **今日收盘**：`{x['今日现价']}` 元",
+                f"> **昨日计划**：止盈线 `{x['昨日止盈目标']}` / 止损线 `{x['昨日止损底线']}`",
+                "",
+                f"💡 **复盘结论**：{x['复盘归因']}",
+                ""
+            ]
+
+    lines += [
+        "---",
+        "> **🛑 铁血纪律**：超短线博弈本质是概率游戏。若次日 9:30-9:40 未能冲高，平盘或微亏务必坚决离场，绝不把超短做成长线套牢！"
+    ]
+
+    with open(os.path.join(REPORT_DIR, "report.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+def run():
+    start = time.time()
+    day = now_cn().strftime("%Y-%m-%d")
+
+    reset_data_source_status()
+    log("获取全市场实时行情……")
+    snapshot = get_market_snapshot(CONFIG)
+    stats = market_stats(snapshot)
+
+    screen = []
+    for s in snapshot:
+        code, name = s["code"], s["name"]
+        price, pct = fnum(s.get("price")), fnum(s.get("change_pct"))
+
+        # 放宽初筛，允许大幅下跌的票进入左侧判定
+        if not np.isfinite(price) or not np.isfinite(pct): continue
+        if price <= 0 or price > float(CONFIG["screening"]["max_price"]): continue
+        if pct <= -9.5: continue 
+        if pct >= limit_rate(code, name) - 0.2: continue
+
+        screen.append(s)
+
+    log(f"硬性过滤后：{len(screen)}只，开始左右侧双轨分析。")
+
+    workers = int(CONFIG.get("data_source", {}).get("max_workers", 8))
+    analyzed, errors = [], []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(analyze_one, s, CONFIG): s for s in screen}
+        for i, future in enumerate(as_completed(futures), 1):
+            try:
+                item = future.result()
+                if item: analyzed.append(item)
+            except Exception as exc:
+                errors.append({"代码": futures[future]["code"], "名称": futures[future]["name"], "错误": str(exc)[:300]})
+
+            if i % 200 == 0 or i == len(futures):
+                log(f"进度 {i}/{len(futures)}，有效分析 {len(analyzed)}")
+
+    df = pd.DataFrame(analyzed)
+
+    if not df.empty:
+        # 按评分降序，评分相同按涨幅绝对值小的排前面（更稳）
+        df["abs_pct"] = df["当日涨幅%"].abs()
+        df = df.sort_values(["评分", "abs_pct"], ascending=[False, True]).drop(columns=["abs_pct"]).reset_index(drop=True)
+
+    picks = df.head(3).copy() if not df.empty else pd.DataFrame()
+
+    if not df.empty:
+        df.to_csv(os.path.join(REPORT_DIR, f"candidates_{day}.csv"), index=False, encoding="utf-8-sig")
+    if not picks.empty:
+        picks.to_csv(os.path.join(REPORT_DIR, f"picks_{day}.csv"), index=False, encoding="utf-8-sig")
+
+    prev_date, review = review_previous(snapshot)
+    save_learning(review)
+
+    if errors:
+        pd.DataFrame(errors).to_csv(
+            os.path.join(REPORT_DIR, "scan_errors.csv"),
+            mode="a", header=not os.path.exists(os.path.join(REPORT_DIR, "scan_errors.csv")),
+            index=False, encoding="utf-8-sig"
+        )
+
+    source_status = get_data_source_status()
+    write_report(day, stats, picks, df, review, source_status)
+
+    log(f"完成：候选{len(df)}只，前三名{len(picks)}只，错误{len(errors)}条。")
+    log("报告位置：reports/report.md")
+
+if __name__ == "__main__":
+    try:
+        with open("config.json", "r", encoding="utf-8") as f:
+            CONFIG = json.load(f)
+        run()
+    except Exception as exc:
+        log(f"扫描失败：{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        with open(os.path.join(REPORT_DIR, "fatal_error.log"), "a", encoding="utf-8") as f:
+            f.write(f"\n{now_cn().isoformat()} {type(exc).__name__}: {exc}\n")
+            f.write(traceback.format_exc())
+        raise
