@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 并发数提高到 4，加快全市场扫描速度
-MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "4"))
+# 【核心修改】并发数设为 2，提速但保留安全空间
+MAX_WORKERS = 2
 
 TOP_N = 3
 MIN_SCORE = 0.0
@@ -47,10 +47,7 @@ def load_config():
                 "exclude_st": True,
                 "exclude_delisting": True
             },
-            "screening": {
-                "shortlist_size": 9999, 
-                "top_n": 3
-            }
+            "screening": {"shortlist_size": 9999, "top_n": 3}
         }
 
 
@@ -137,76 +134,7 @@ def calculate_indicators(df):
     return df
 
 
-def get_headers():
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-    ]
-    return {"User-Agent": random.choice(uas), "Referer": "https://finance.qq.com/"}
-
-
-def fetch_tencent_15m(code):
-    market = "sh" if str(code).startswith(("6", "9")) else "sz"
-    symbol = f"{market}{code}"
-    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
-    params = {"param": f"{symbol},m15,,,160,qfq"}
-    try:
-        # 超时缩短为 5 秒，防止卡死
-        resp = requests.get(url, params=params, headers=get_headers(), timeout=5)
-        resp.raise_for_status()
-        payload = resp.json()
-        node = payload.get("data", {}).get(symbol, {})
-        rows = node.get("m15") or node.get("qfq_m15") or []
-        if not rows: return None
-        df = pd.DataFrame(rows).iloc[:, :6]
-        df.columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
-        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.dropna(subset=["收盘"]).reset_index(drop=True)
-    except Exception:
-        return None
-
-
-def fetch_sina_15m(code):
-    market = "sh" if str(code).startswith(("6", "9")) else "sz"
-    symbol = f"{market}{code}"
-    url = f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_{symbol}_15m=/CN_MarketDataService.getKLineData"
-    params = {"symbol": symbol, "scale": "15", "ma": "no", "datalen": "160"}
-    headers = {"User-Agent": random.choice(["Mozilla/5.0", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"]), "Referer": "https://finance.sina.com.cn/"}
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
-        resp.raise_for_status()
-        text = resp.text
-        match = re.search(r"=\s*\((\[.*\])\);", text, re.S)
-        if not match: return None
-        rows = json.loads(match.group(1))
-        if not rows: return None
-        df = pd.DataFrame(rows)
-        df = df.rename(columns={"day": "时间", "open": "开盘", "close": "收盘", "high": "最高", "low": "最低", "volume": "成交量"})
-        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.dropna(subset=["收盘"]).reset_index(drop=True)
-    except Exception:
-        return None
-
-
-def fetch_intraday_15m(code):
-    # 移除所有 sleep，全速请求
-    df = fetch_tencent_15m(code)
-    if df is None or len(df) < 30:
-        df = fetch_sina_15m(code)
-    if df is None or len(df) < 30:
-        return None
-
-    close = df["收盘"]
-    dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    dea = dif.ewm(span=9, adjust=False).mean()
-    df["DIF"] = dif
-    df["DEA"] = dea
-    df["MACD"] = 2 * (dif - dea)
-    df["RSI15"] = calculate_rsi(close, 14)
-    return df
+# ========== 已彻底移除 15 分钟请求 ==========
 
 
 def market_temperature(snapshot):
@@ -432,6 +360,8 @@ def apply_learned_penalties(candidates):
 
 def fetch_hist(code, today_compact):
     try:
+        # 【核心修改】加入随机 0.2~0.5 秒的休眠，模拟真人操作，防封
+        time.sleep(random.uniform(0.2, 0.5))
         hist = data_source.get_history(code, CONFIG)
         if hist is not None and len(hist) >= 60: return hist
         raise RuntimeError("历史行情为空或不足60条")
@@ -479,41 +409,15 @@ def process_single_stock(row, today_compact, board_map=None):
         support_dist = ((price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan)
         resistance_dist = ((resistance / price - 1) * 100 if (np.isfinite(resistance) and price > 0) else np.nan)
 
-        # 拿不到 15 分钟数据返回 None，不抛出异常，直接跳过分钟打分
-        intraday = fetch_intraday_15m(code)
-        m15_macd, m15_prev, m15_dif, m15_dea, m15_rsi = np.nan, np.nan, np.nan, np.nan, np.nan
-        m15_volume_trend = "分钟数据不可用"
-
-        if intraday is not None and len(intraday) >= 3:
-            ilast = intraday.iloc[-1]
-            iprev = intraday.iloc[-2]
-            m15_macd = safe_float(ilast.get("MACD"))
-            m15_prev = safe_float(iprev.get("MACD"))
-            m15_dif = safe_float(ilast.get("DIF"))
-            m15_dea = safe_float(ilast.get("DEA"))
-            m15_rsi = safe_float(ilast.get("RSI15"))
-            v = pd.to_numeric(intraday["成交量"].tail(6), errors="coerce")
-            if len(v) >= 6 and v.iloc[-3:].mean() > v.iloc[:3].mean(): m15_volume_trend = "尾盘量能增强"
-            elif len(v) >= 6: m15_volume_trend = "尾盘量能平稳/减弱"
+        # 已彻底移除 15 分钟数据获取
+        m15_volume_trend = "基于日线综合"
+        m15_macd = np.nan
+        m15_rsi = np.nan
 
         score = 0.0
         reasons, risks = [], []
 
-        # ===== 15分钟指标评分（如果不可用会跳过，不影响下面日线指标评分） =====
-        if np.isfinite(m15_macd) and np.isfinite(m15_prev):
-            if m15_macd > m15_prev: score += 1.1; reasons.append("15分钟MACD改善")
-            else: risks.append("15分钟MACD走弱")
-            if np.isfinite(m15_dif) and np.isfinite(m15_dea) and m15_dif > m15_dea: score += 0.7; reasons.append("15分钟MACD处于多头")
-            else: risks.append("15分钟MACD未形成多头")
-        else: risks.append("缺少15分钟数据，尾盘信号不完整")
-
-        if np.isfinite(m15_rsi):
-            if 48 <= m15_rsi <= 68: score += 0.8; reasons.append("15分钟RSI强度适中")
-            elif 42 <= m15_rsi < 48: score += 0.35
-            elif m15_rsi >= 78: risks.append("15分钟RSI过热")
-        else: risks.append("15分钟RSI不可用")
-
-        # ===== 日线指标评分（无论 15 分钟拉没拉到，都会继续执行） =====
+        # ===== 日线指标评分（完全保留） =====
         if price >= ma5 and price >= ma10: score += 0.8; reasons.append("价格站在MA5/MA10上方")
         elif price >= ma20: score += 0.35
         else: risks.append("价格低于MA20")
@@ -544,17 +448,13 @@ def process_single_stock(row, today_compact, board_map=None):
             if resistance_dist <= 1.2: risks.append("临近20/60日压力位，突破空间有限")
             elif resistance_dist >= 2.5: score += 0.45; reasons.append("上方短期压力空间尚可")
 
-        if np.isfinite(support_dist) and support_dist <= 2.0 and m15_volume_trend == "尾盘量能增强": score += 0.35; reasons.append("支撑附近出现量能增强")
-        if m15_volume_trend == "尾盘量能增强": score += 0.25
-
         limit_pct = (20.0 if code.startswith(("300", "301")) else 10.0)
         if pct <= -10.0 or pct >= limit_pct - 0.15 or price > 800: return None
 
         for risk, penalty in [
-            ("15分钟MACD走弱", 0.6), ("15分钟MACD未形成多头", 0.4), ("15分钟RSI过热", 0.5),
             ("价格低于MA20", 0.6), ("日线中期趋势偏弱", 0.4), ("当日涨幅过大，隔夜追高风险", 0.8),
             ("量比过高，警惕尾盘分歧", 0.5), ("换手率异常偏高", 0.4), ("临近20/60日压力位，突破空间有限", 0.8),
-            ("距离下方支撑较远", 0.3), ("缺少15分钟数据，尾盘信号不完整", 0.8)
+            ("距离下方支撑较远", 0.3)
         ]:
             if risk in risks: score -= penalty
 
@@ -572,9 +472,9 @@ def process_single_stock(row, today_compact, board_map=None):
             "量比": round(volume_ratio, 2),
             "日线MACD": round(daily_macd, 4) if np.isfinite(daily_macd) else np.nan,
             "日线RSI": round(daily_rsi, 1) if np.isfinite(daily_rsi) else np.nan,
-            "15分钟MACD": round(m15_macd, 4) if np.isfinite(m15_macd) else np.nan,
-            "15分钟RSI": round(m15_rsi, 1) if np.isfinite(m15_rsi) else np.nan,
-            "尾盘量能": m15_volume_trend,
+            "15分钟MACD": np.nan,
+            "15分钟RSI": np.nan,
+            "尾盘量能": "基于日线综合",
             "支撑位": round(support, 3) if np.isfinite(support) else np.nan,
             "压力位": round(resistance, 3) if np.isfinite(resistance) else np.nan,
             "距支撑%": round(support_dist, 2) if np.isfinite(support_dist) else np.nan,
@@ -774,10 +674,7 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    # ================= 核心改动 =================
-    # 彻底删除任何数量截断，无视配置文件，全市场拉满
-    # ============================================
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，无任何数量限制）")
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，并发数={MAX_WORKERS}）")
 
     market_stats = market_temperature(spot_all)
     sector_df, sector_status = build_sector_heat(spot_all)
@@ -790,8 +687,6 @@ def scan_market():
     total = len(spot)
     success = 0
     failed = 0
-
-    log(f"开始隔夜超短评分；并发数={MAX_WORKERS}")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_single_stock, row, today_compact, None): row for _, row in spot.iterrows()}
