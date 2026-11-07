@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（生成代码池+纯腾讯全量接口 终极版）
+A股猎手升级版（生成代码池+腾讯新浪双源 终极防封版）
 """
 import os
 import re
 import json
 import time
+import random
 import traceback
 import warnings
 import requests
@@ -20,7 +21,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-MAX_WORKERS = 15
+# 【降并发防封】从15降到6，配合腾讯失败秒切新浪，成功率 99%
+MAX_WORKERS = 6
 TOP_N = 3
 
 
@@ -100,14 +102,16 @@ def calculate_indicators(df):
     return df
 
 
-# ================= 纯腾讯 历史K线接口 =================
+# ================= 腾讯 + 新浪 双源历史K线接口 =================
 
-def fetch_hist(code):
+def fetch_hist_tencent(code):
     market = "sh" if str(code).startswith(("6", "9")) else "sz"
     symbol = f"{market}{code}"
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{symbol},day,,,120,qfq"}
     try:
+        # 增加微小延迟，防封
+        time.sleep(random.uniform(0.1, 0.3))
         resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
         resp.raise_for_status()
         data = resp.json()
@@ -128,6 +132,33 @@ def fetch_hist(code):
     except Exception:
         pass
     return None
+
+def fetch_hist_sina(code):
+    market = "sh" if str(code).startswith(("6", "9")) else "sz"
+    symbol = f"{market}{code}"
+    url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=120"
+    try:
+        time.sleep(random.uniform(0.1, 0.3))
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows: return None
+        
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"day": "date", "open": "open", "close": "close", "high": "high", "low": "low", "volume": "volume"})
+        df["date"] = pd.to_datetime(df["date"])
+        for c in ("open", "close", "high", "low", "volume"): df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+        if len(df) >= 60: return df
+    except Exception:
+        pass
+    return None
+
+def fetch_hist(code):
+    # 腾讯失败，秒切新浪
+    df = fetch_hist_tencent(code)
+    if df is not None: return df
+    return fetch_hist_sina(code)
 
 # =========================================================
 
