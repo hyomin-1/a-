@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（生成代码池+腾讯新浪双源 终极防封版）
+A股猎手升级版（生成代码池+腾讯新浪双源 极速版）
 """
 import os
 import re
@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【降并发防封】从15降到6，配合腾讯失败秒切新浪，成功率 99%
-MAX_WORKERS = 6
+# 【极速提速】并发拉到 15，取消所有人为休眠，靠超时和双源兜底
+MAX_WORKERS = 15
 TOP_N = 3
 
 
@@ -110,8 +110,7 @@ def fetch_hist_tencent(code):
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{symbol},day,,,120,qfq"}
     try:
-        # 增加微小延迟，防封
-        time.sleep(random.uniform(0.1, 0.3))
+        # 取消休眠，直接请求
         resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
         resp.raise_for_status()
         data = resp.json()
@@ -138,7 +137,7 @@ def fetch_hist_sina(code):
     symbol = f"{market}{code}"
     url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=120"
     try:
-        time.sleep(random.uniform(0.1, 0.3))
+        # 取消休眠
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
         resp.raise_for_status()
         rows = resp.json()
@@ -253,19 +252,12 @@ def process_single_stock(row):
 
 
 def get_full_market_snapshot():
-    log("正在生成全市场代码池并获取腾讯实时行情（纯本地生成，绝不截断）...")
+    log("正在生成全市场代码池并获取腾讯实时行情...")
     
-    # 自己生成全市场代码，绕过接口的截断
     code_list = []
-    # 沪市主板 600-605
-    for i in range(600000, 606000):
-        code_list.append(f"sh{i}")
-    # 深市主板 000-003
-    for i in range(1, 4000):
-        code_list.append(f"sz{str(i).zfill(6)}")
-    # 创业板 300-301
-    for i in range(300000, 302000):
-        code_list.append(f"sz{i}")
+    for i in range(600000, 606000): code_list.append(f"sh{i}")
+    for i in range(1, 4000): code_list.append(f"sz{str(i).zfill(6)}")
+    for i in range(300000, 302000): code_list.append(f"sz{i}")
     
     quotes = []
     batch_size = 60
@@ -275,7 +267,6 @@ def get_full_market_snapshot():
         url = f"https://qt.gtimg.cn/q={','.join(batch)}"
         res = []
         try:
-            # 1.5秒超时，腾讯批量接口极快
             resp = requests.get(url, headers=headers, timeout=(1.5, 1.5))
             resp.encoding = "gb18030"
             lines = resp.text.split(";")
@@ -285,7 +276,7 @@ def get_full_market_snapshot():
                 if len(parts) > 49:
                     code = parts[2]
                     price = safe_float(parts[3])
-                    if price > 0:  # 过滤停牌和无效代码
+                    if price > 0:
                         res.append({
                             "代码": code, "名称": parts[1], 
                             "最新价": price,
@@ -300,8 +291,8 @@ def get_full_market_snapshot():
         
     batches = [code_list[i:i+batch_size] for i in range(0, len(code_list), batch_size)]
     
-    # 并发拉取实时行情
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # 实时行情也拉高并发
+    with ThreadPoolExecutor(max_workers=15) as executor:
         futures = [executor.submit(fetch_batch, b) for b in batches]
         for f in as_completed(futures):
             quotes.extend(f.result())
@@ -322,14 +313,13 @@ def scan_market():
     code = spot["纯代码"]
     name = spot["名称"].astype(str)
     
-    # 剔除科创板(688/689)和北交所(代码不以6/0/3开头)
     is_sz_sh = code.str.match(r"^(000|001|002|003|300|301|600|601|603|605)")
     limit_pct = np.where(code.str.startswith(("300", "301")), 20.0, 10.0)
 
     spot = spot[is_sz_sh & (~name.str.contains(r"ST|退", case=False, na=False)) & (spot["最新价"] > 0) & (spot["最新价"] <= 800) & (spot["涨跌幅"] > -10.0) & (spot["涨跌幅"] < (limit_pct - 0.15))].copy()
     spot = spot.sort_values("成交额", ascending=False)
 
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，已剔除科创板）")
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（已剔除科创板）")
 
     candidates = []
     total = len(spot)
@@ -363,7 +353,6 @@ def scan_market():
         df_all.to_csv(os.path.join(REPORT_DIR, f"candidates_{today}.csv"), index=False, encoding="utf-8-sig")
         result.to_csv(os.path.join(REPORT_DIR, f"{today}.csv"), index=False, encoding="utf-8-sig")
 
-        # 生成 markdown 报告
         lines = [f"# A股猎手｜全市场扫描报告", f"> {today} 策略：14:50观察买入 / 次日9:30退出", "", "## 最强3只"]
         for i, item in enumerate(result.to_dict("records"), 1):
             lines.extend([
