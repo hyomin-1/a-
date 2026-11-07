@@ -4329,3 +4329,7 @@
 301707,展芯股份,501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz301707%2Cday%2C%2C%2C180%2Cqfq
 301717,超纯应材,501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz301717%2Cday%2C%2C%2C180%2Cqfq
 301718,通则康威,501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz301718%2Cday%2C%2C%2C180%2Cqfq
+2026-11-07 20:52:41,688836 宇树科技-W: RuntimeError: 历史行情获取失败：688836历史K线不足60条
+2026-11-07 20:52:59,301660 粤芯半导体-U: RuntimeError: 历史行情获取失败：301660历史K线不足60条
+2026-11-07 20:53:15,688801 燧原科技-U: RuntimeError: 历史行情获取失败：688801历史K线不足60条
+2026-11-07 20:53:19,001246 力勤资源: RuntimeError: 历史行情获取失败：001246历史K线不足60条
