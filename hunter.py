@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（单线程极速防封全量版）
+A股猎手升级版（东财高并发极速防卡死版 - 终极版）
 策略：14:50尾盘观察买入，次日9:30—9:40退出评估
 """
 import os
@@ -22,8 +22,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【降维打击】并发设为 1，单线程排队，绝不触碰风控阈值
-MAX_WORKERS = 1
+# 【终极提速】并发数拉满到 8，任何超时瞬间抛弃，绝不死等
+MAX_WORKERS = 8
 TOP_N = 3
 MIN_SCORE = 0.0
 HISTORY_DAYS = 120
@@ -122,12 +122,9 @@ def calculate_indicators(df):
 
 def fetch_hist(code, today_compact):
     """
-    单线程低延迟抓取策略：
-    每次请求前休眠 0.05 秒，超时设为 2 秒。先东财，后腾讯。
-    绝不卡死，东财封了秒切腾讯。
+    【绝对防卡死】东财为主，腾讯为辅。
+    超时设置为 (1.5, 1.5)，1.5秒拿不到直接抛弃，进入备选池。
     """
-    time.sleep(0.05) # 轻微延迟，避免机器特征
-    
     # 1. 东方财富日线
     secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -137,8 +134,7 @@ def fetch_hist(code, today_compact):
         "limit": "120", "ut": "bd1d9ddb04089700cf9c27f6f7426281"
     }
     try:
-        # 超时缩短为 2 秒，不返回立刻抛弃
-        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=2)
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(1.5, 1.5))
         resp.raise_for_status()
         data = resp.json()
         klines = data.get("data", {}).get("klines")
@@ -158,15 +154,14 @@ def fetch_hist(code, today_compact):
     except Exception:
         pass
 
-    # 2. 腾讯备用
+    # 2. 腾讯备用 (同样限制1.5秒超时)
     try:
-        time.sleep(0.05)
         hist = data_source.get_history(code, CONFIG)
         if hist is not None and len(hist) >= 60: return hist
     except Exception:
         pass
 
-    raise RuntimeError("东财/腾讯历史行情均获取失败")
+    raise RuntimeError("历史行情获取失败(超时或空数据)")
 
 
 def market_temperature(snapshot):
@@ -764,7 +759,6 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    # 全市场扫描
     spot = spot.sort_values("成交额", ascending=False)
 
     log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描）")
