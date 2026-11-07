@@ -4537,3 +4537,12 @@
 2026-11-07 22:04:44,301071 力量钻石: RuntimeError: 历史行情获取失败：501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz301071%2Cday%2C%2C%2C180%2Cqfq
 2026-11-07 22:04:44,300776 帝尔激光: RuntimeError: 历史行情获取失败：501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz300776%2Cday%2C%2C%2C180%2Cqfq
 2026-11-07 22:04:45,603662 柯力传感: RuntimeError: 历史行情获取失败：501 Server Error: Not Implemented for url: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh603662%2Cday%2C%2C%2C180%2Cqfq
+2026-11-07 23:08:27,301660 粤芯半导体-U: RuntimeError: 历史行情获取失败：301660历史K线不足60条
+2026-11-07 23:08:36,001246 力勤资源: RuntimeError: 历史行情获取失败：001246历史K线不足60条
+2026-11-07 23:08:44,601091 沈鼓集团: RuntimeError: 历史行情获取失败：601091历史K线不足60条
+2026-11-07 23:08:46,301717 超纯应材: RuntimeError: 历史行情获取失败：301717历史K线不足60条
+2026-11-07 23:08:47,301718 通则康威: RuntimeError: 历史行情获取失败：301718历史K线不足60条
+2026-11-07 23:08:49,301699 洛轴股份: RuntimeError: 历史行情获取失败：301699历史K线不足60条
+2026-11-07 23:08:57,301689 电科思仪: RuntimeError: 历史行情获取失败：301689历史K线不足60条
+2026-11-07 23:09:08,601123 马矿股份: RuntimeError: 历史行情获取失败：601123历史K线不足60条
+2026-11-07 23:09:10,301688 格林生物: RuntimeError: 历史行情获取失败：301688历史K线不足60条
