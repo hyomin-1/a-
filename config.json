@@ -1,10 +1,10 @@
 {
-  "version": "ashare-hunter-v4-100pts",
+  "version": "overnight-scalp-v4-1450",
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
     "include_chinext": true,
-    "include_star_market": false,
+    "include_star_market": true,
     "include_beijing": false,
     "exclude_st": true,
     "exclude_delisting": true
@@ -12,29 +12,74 @@
   "data_source": {
     "primary": "sina",
     "history": "tencent",
+    "intraday": "tencent_15m",
     "max_workers": 8,
     "request_timeout_seconds": 10
   },
   "screening": {
     "shortlist_size": 500,
     "top_n": 3,
+    "buy_top_n": 2,
     "min_price": 0,
     "max_price": 800,
     "min_day_pct": -10,
-    "exclude_limit_up": true
+    "exclude_limit_up": true,
+    "amount_minimum": 0,
+    "min_score": 0
   },
-  "v4_params": {
-    "atr_period": 14,
-    "atr_stop_multiplier": 1.5,
-    "ma_periods": [5, 10, 20, 60]
+  "indicators": {
+    "daily_macd_role": "trend_filter_only",
+    "intraday_macd_period": "15m",
+    "intraday_rsi_period": 14,
+    "ma_periods": [5, 10, 20, 60],
+    "support_resistance_lookback": [20, 60]
   },
   "learning": {
     "enabled": true,
+    "review_previous_recommendations": true,
     "persist_reports": true
   },
   "output": {
     "directory": "reports",
     "save_candidates": true,
-    "save_top3": true
+    "save_top3": true,
+    "save_market_heat": true,
+    "save_sector_heat": true,
+    "save_learning": true,
+    "compact_report": true
+  },
+  "overnight": {
+    "strategy": "tail_close_buy_next_morning_exit",
+    "entry_observation_time": "14:50",
+    "entry_window": "14:45-14:55",
+    "exit_observation_window": "09:30-09:40",
+    "top_n": 3,
+    "buy_top_n": 2,
+    "capital_per_stock": 20000,
+    "do_not_force_trade": true,
+    "profit_rules": {
+      "first_target_pct": 1.0,
+      "first_sell_ratio": 0.5,
+      "second_target_pct": 2.0,
+      "second_sell_remaining": true
+    },
+    "risk_review": {
+      "first_review_pct": -1.0,
+      "second_review_pct": -2.0,
+      "automatic_stop_loss": false,
+      "review_indicators": [
+        "MA5",
+        "MA10",
+        "MA20",
+        "MACD",
+        "volume",
+        "support",
+        "sector_strength"
+      ]
+    },
+    "time_exit": {
+      "deadline": "09:40",
+      "enabled": true
+    }
   }
 }
