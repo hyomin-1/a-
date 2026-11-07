@@ -1,30 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 A股猎手｜4万双模型回测：9:30开盘买入 vs 14:50尾盘买入
-
-资金结构：
-- 总资金 40,000
-- 最多 2 只，每只 20,000
-- 每只内部拆两批：
-    10,000 在 +1% 止盈
-    10,000 在 +2% 止盈
-- 止损参考支撑位；止盈参考压力位做上限约束
-- 选股看 MACD / RSI / MA10 / MA20 / 量比代理
-
-运行方式：
-    python backtest_dual.py --start 2025-11-07 --end 2026-11-07
-
-程序会依次跑两个模型：
-    1. open  模型：9:30 开盘价买入
-    2. tail  模型：14:50 尾盘买入（用收盘价近似 + 额外滑点）
-最后输出两个模型各自的汇总，方便直接对比。
+已内置：排除科创板(688/689)和北交所(8/4开头)股票池
 """
 
 import argparse
 import copy
 import json
 import os
-import time
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -125,7 +108,7 @@ def build_features(df):
     return df
 
 
-def score_record(rec, config):
+def score_record(rec):
     score = 0.0
     reasons, risks = [], []
 
@@ -224,7 +207,14 @@ def screen_record(rec, config, args):
     if scr.get("exclude_limit_up", True) and pct >= lim - 0.2:
         return None
 
-    item = score_record(rec, config)
+    # 压力位过滤：上方空间不足 0.5% 不买
+    price_now = fnum(rec.get("close"))
+    resistance = fnum(rec.get("resistance"))
+    if np.isfinite(resistance) and resistance > 0 and np.isfinite(price_now):
+        if resistance / price_now - 1 < 0.005:
+            return None
+
+    item = score_record(rec)
     if item is None:
         return None
 
@@ -317,8 +307,19 @@ def build_day_map(histories, args):
     return day_map
 
 
+def check_exit(o, h, l, stop, tp):
+    if np.isfinite(o) and o <= stop:
+        return o, "止损跳空"
+    if np.isfinite(l) and l <= stop:
+        return stop, "止损"
+    if np.isfinite(o) and o >= tp:
+        return o, "止盈跳空"
+    if np.isfinite(h) and h >= tp:
+        return tp, "止盈"
+    return None, None
+
+
 def run_one_model(config, args, mode):
-    """mode: 'open' 或 'tail'。两个模型共用选股和资金规则，只改买入价。"""
     model_dir = os.path.join(REPORT_ROOT, mode)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -333,8 +334,18 @@ def run_one_model(config, args, mode):
     log(f"===== 开始模型：{mode} =====")
     data_source.reset_data_source_status()
     universe = data_source.get_stock_universe(config)
+    
+    # ========================================================
+    # 强制过滤掉科创板和北交所股票
+    # ========================================================
+    original_count = len(universe)
+    universe = [s for s in universe if not s["code"].startswith(("688", "689", "8", "4"))]
+    log(f"股票池过滤：过滤前 {original_count} 只，剔除科创/北交后剩 {len(universe)} 只")
+    # ========================================================
+
     if args.max_stocks and args.max_stocks > 0:
         universe = universe[:args.max_stocks]
+        log(f"按 max_stocks 截断：{len(universe)} 只")
 
     histories, errors = load_histories(universe, config, args, hist_config)
     if not histories:
@@ -342,7 +353,7 @@ def run_one_model(config, args, mode):
 
     day_map = build_day_map(histories, args)
     trade_dates = sorted(day_map.keys())
-    if len(trade_dates) < 2:
+    if len(trade_dates) < 3:
         raise RuntimeError(f"{mode} 模型交易日不足")
 
     cash = float(args.cash)
@@ -354,9 +365,13 @@ def run_one_model(config, args, mode):
     commission_rate = float(args.commission)
     stamp_rate = float(args.stamp)
     base_slippage = float(args.slippage)
-    tail_extra_slippage = float(args.tail_extra_slippage) if mode == "tail" else 0.0
+    tail_extra = float(args.tail_extra_slippage) if mode == "tail" else 0.0
     max_positions = int(args.max_positions)
-    per_stock_cash = initial_cash / max_positions  # 每只 2 万
+    per_stock_cash = initial_cash / max_positions
+    max_hold_days = int(args.max_hold_days)
+
+    def calc_fee(amount):
+        return max(5.0, amount * commission_rate)
 
     def buy_price_for(rec):
         if mode == "open":
@@ -364,35 +379,36 @@ def run_one_model(config, args, mode):
             if not np.isfinite(raw) or raw <= 0:
                 raw = fnum(rec.get("close"))
             return raw * (1 + base_slippage) if np.isfinite(raw) and raw > 0 else np.nan
-        else:
-            raw = fnum(rec.get("close"))
-            return raw * (1 + base_slippage + tail_extra_slippage) if np.isfinite(raw) and raw > 0 else np.nan
+        raw = fnum(rec.get("close"))
+        return raw * (1 + base_slippage + tail_extra) if np.isfinite(raw) and raw > 0 else np.nan
 
-    def do_sell(pos, date, raw_price, reason, di, batch_name, batch_shares):
+    def do_sell(pos, date, raw_price, reason, di, batch):
         nonlocal cash
-        if not np.isfinite(raw_price) or raw_price <= 0 or batch_shares <= 0:
+        shares = pos["shares"][batch]
+        if not np.isfinite(raw_price) or raw_price <= 0 or shares <= 0:
             return
 
         sell_price = raw_price * (1 - base_slippage)
-        amount = sell_price * batch_shares
-        fee = max(5.0, amount * commission_rate) + amount * stamp_rate
+        amount = sell_price * shares
+        fee = calc_fee(amount) + amount * stamp_rate
         proceeds = amount - fee
         cash += proceeds
 
-        pnl = proceeds - pos["batch_cost"][batch_name]
-        pnl_pct = pnl / pos["batch_cost"][batch_name] * 100 if pos["batch_cost"][batch_name] > 0 else np.nan
+        cost = pos["batch_cost"][batch]
+        pnl = proceeds - cost
+        pnl_pct = pnl / cost * 100 if cost > 0 else np.nan
 
         trades.append({
             "模型": mode,
             "代码": pos["code"],
             "名称": pos["name"],
-            "批次": batch_name,
+            "批次": batch,
             "买入日期": pos["buy_date"],
             "买入价": round(pos["buy_price"], 4),
             "卖出日期": date.strftime("%Y-%m-%d"),
             "卖出价": round(sell_price, 4),
-            "股数": batch_shares,
-            "买入成本": round(pos["batch_cost"][batch_name], 2),
+            "股数": shares,
+            "买入成本": round(cost, 2),
             "卖出净额": round(proceeds, 2),
             "盈亏": round(pnl, 2),
             "盈亏%": round(pnl_pct, 2) if np.isfinite(pnl_pct) else None,
@@ -402,10 +418,14 @@ def run_one_model(config, args, mode):
             "支撑位": round(pos["support"], 4) if np.isfinite(pos["support"]) else None,
             "压力位": round(pos["resistance"], 4) if np.isfinite(pos["resistance"]) else None,
         })
+        pos["done"][batch] = True
 
-    for di, date in enumerate(trade_dates):
+    for di in range(1, len(trade_dates)):
+        date = trade_dates[di]
+        prev_date = trade_dates[di - 1]
         today = day_map.get(date, {})
-        sold_today_codes = set()
+        prev_day = day_map.get(prev_date, {})
+        sold_today = set()
 
         for pos in positions:
             rec = today.get(pos["code"])
@@ -428,61 +448,35 @@ def run_one_model(config, args, mode):
             if not np.isfinite(c):
                 continue
 
-            # 批次 1：1万，+1% 止盈
-            if not pos["batch_done"]["b1"]:
-                tp1 = pos["batch_targets"]["b1"]
-                stop_price = pos["stop"]
-                raw_exit, reason = None, None
+            if not pos["done"]["b1"]:
+                px, reason = check_exit(o, h, l, pos["stop"], pos["tp"]["b1"])
+                if px is not None:
+                    do_sell(pos, date, px, reason + "（+1%批）", di, "b1")
 
-                if np.isfinite(o) and o <= stop_price:
-                    raw_exit, reason = o, "止损跳空"
-                elif np.isfinite(o) and o >= tp1:
-                    raw_exit, reason = o, "止盈+1%跳空"
-                elif np.isfinite(l) and l <= stop_price:
-                    raw_exit, reason = stop_price, "止损"
-                elif np.isfinite(h) and h >= tp1:
-                    raw_exit, reason = tp1, "止盈+1%"
+            if not pos["done"]["b2"]:
+                px, reason = check_exit(o, h, l, pos["stop"], pos["tp"]["b2"])
+                if px is not None:
+                    do_sell(pos, date, px, reason + "（+2%批）", di, "b2")
 
-                if raw_exit is not None:
-                    do_sell(pos, date, raw_exit, reason, di, "b1", pos["shares"]["b1"])
-                    pos["batch_done"]["b1"] = True
+            if max_hold_days > 0 and days_held >= max_hold_days:
+                if not pos["done"]["b1"]:
+                    do_sell(pos, date, c, "持有到期（+1%批）", di, "b1")
+                if not pos["done"]["b2"]:
+                    do_sell(pos, date, c, "持有到期（+2%批）", di, "b2")
 
-            # 批次 2：1万，+2% 止盈
-            if not pos["batch_done"]["b2"] and not pos["batch_done"]["b1"]:
-                # 批次 2 只在批次 1 未触发时继续；如果批次 1 已卖，批次 2 仍独立判断
-                pass
-
-            if not pos["batch_done"]["b2"]:
-                tp2 = pos["batch_targets"]["b2"]
-                stop_price = pos["stop"]
-                raw_exit, reason = None, None
-
-                if np.isfinite(o) and o <= stop_price:
-                    raw_exit, reason = o, "止损跳空"
-                elif np.isfinite(o) and o >= tp2:
-                    raw_exit, reason = o, "止盈+2%跳空"
-                elif np.isfinite(l) and l <= stop_price:
-                    raw_exit, reason = stop_price, "止损"
-                elif np.isfinite(h) and h >= tp2:
-                    raw_exit, reason = tp2, "止盈+2%"
-
-                if raw_exit is not None:
-                    do_sell(pos, date, raw_exit, reason, di, "b2", pos["shares"]["b2"])
-                    pos["batch_done"]["b2"] = True
-
-            # 两批都完成，移除持仓
-            if pos["batch_done"]["b1"] and pos["batch_done"]["b2"]:
+            if pos["done"]["b1"] and pos["done"]["b2"]:
                 positions.remove(pos)
-                sold_today_codes.add(pos["code"])
+                sold_today.add(pos["code"])
 
-        # 买入：收盘/开盘选股，空几个仓位买几个
         slots = max_positions - len(positions)
-        if slots > 0 and today:
+        if slots > 0 and prev_day and today:
             held = {p["code"] for p in positions}
             cands = []
 
-            for code, rec in today.items():
-                if code in held or code in sold_today_codes:
+            for code, rec in prev_day.items():
+                if code in held or code in sold_today:
+                    continue
+                if code not in today:
                     continue
                 item = screen_record(rec, config, args)
                 if item is not None:
@@ -490,32 +484,28 @@ def run_one_model(config, args, mode):
 
             cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-            for score, pct, code, rec in cands:
+            for score, pct, code, prev_rec in cands:
                 if len(positions) >= max_positions:
                     break
 
-                bp = buy_price_for(rec)
+                today_rec = today[code]
+                bp = buy_price_for(today_rec)
                 if not np.isfinite(bp) or bp <= 0:
                     continue
 
-                # 每只股票预算 2 万；如果现金不足，按可用现金买
                 budget = min(cash, per_stock_cash)
-                if budget < bp * 100:
+                if budget < bp * 200:
                     continue
 
-                support = fnum(rec.get("support"))
-                resistance = fnum(rec.get("resistance"))
+                support = fnum(prev_rec.get("support"))
+                resistance = fnum(prev_rec.get("resistance"))
 
-                # 两批各自目标价
-                b1_target = bp * 1.01
-                b2_target = bp * 1.02
-
-                # 压力位约束：如果压力位更近，把止盈压到压力位下方
+                tp1 = bp * 1.01
+                tp2 = bp * 1.02
                 if np.isfinite(resistance) and resistance > bp * 1.001:
-                    b1_target = min(b1_target, resistance * 0.998)
-                    b2_target = min(b2_target, resistance * 0.998)
+                    tp1 = min(tp1, resistance * 0.998)
+                    tp2 = min(tp2, resistance * 0.998)
 
-                # 止损参考支撑位
                 stop = bp * (1 - float(args.stop_loss_pct) / 100.0)
                 if np.isfinite(support) and 0 < support < bp * 0.999:
                     stop = max(stop, support * 0.997)
@@ -523,49 +513,42 @@ def run_one_model(config, args, mode):
                     stop = bp * (1 - float(args.stop_loss_pct) / 100.0)
 
                 total_shares = int(budget / bp / 100) * 100
+                while total_shares >= 200:
+                    b1 = (total_shares // 2 // 100) * 100
+                    b2 = total_shares - b1
+                    if b1 < 100 or b2 < 100:
+                        total_shares -= 100
+                        continue
+                    cost1 = bp * b1 + calc_fee(bp * b1)
+                    cost2 = bp * b2 + calc_fee(bp * b2)
+                    if cost1 + cost2 <= cash:
+                        break
+                    total_shares -= 100
+
                 if total_shares < 200:
                     continue
 
-                b1_shares = (total_shares // 200) * 100
-                b2_shares = total_shares - b1_shares
-                if b1_shares < 100 or b2_shares < 100:
+                b1 = (total_shares // 2 // 100) * 100
+                b2 = total_shares - b1
+                if b1 < 100 or b2 < 100:
                     continue
 
-                # 扣现金
-                total_cost = 0.0
-                for sh in (b1_shares, b2_shares):
-                    amt = bp * sh
-                    fee = max(5.0, amt * commission_rate)
-                    total_cost += amt + fee
+                cost1 = bp * b1 + calc_fee(bp * b1)
+                cost2 = bp * b2 + calc_fee(bp * b2)
+                if cost1 + cost2 > cash:
+                    continue
 
-                if total_cost > cash:
-                    # 减少一手再试
-                    if total_shares >= 300:
-                        total_shares -= 100
-                        b1_shares = (total_shares // 200) * 100
-                        b2_shares = total_shares - b1_shares
-                        total_cost = 0.0
-                        for sh in (b1_shares, b2_shares):
-                            amt = bp * sh
-                            fee = max(5.0, amt * commission_rate)
-                            total_cost += amt + fee
-                    if total_cost > cash or b1_shares < 100 or b2_shares < 100:
-                        continue
-
-                cash -= total_cost
+                cash -= cost1 + cost2
                 positions.append({
-                    "code": code, "name": rec["name"],
+                    "code": code, "name": today_rec["name"],
                     "buy_date": date.strftime("%Y-%m-%d"), "buy_idx": di,
                     "buy_price": bp,
-                    "shares": {"b1": b1_shares, "b2": b2_shares},
-                    "batch_cost": {
-                        "b1": bp * b1_shares + max(5.0, bp * b1_shares * commission_rate),
-                        "b2": bp * b2_shares + max(5.0, bp * b2_shares * commission_rate),
-                    },
-                    "batch_targets": {"b1": b1_target, "b2": b2_target},
-                    "batch_done": {"b1": False, "b2": False},
+                    "shares": {"b1": b1, "b2": b2},
+                    "batch_cost": {"b1": cost1, "b2": cost2},
+                    "tp": {"b1": tp1, "b2": tp2},
+                    "done": {"b1": False, "b2": False},
                     "stop": stop,
-                    "last_close": fnum(rec.get("close")),
+                    "last_close": fnum(today_rec.get("close")),
                     "support": support,
                     "resistance": resistance,
                     "score": round(score, 2),
@@ -574,7 +557,7 @@ def run_one_model(config, args, mode):
         mv = 0.0
         for p in positions:
             for b in ("b1", "b2"):
-                if not p["batch_done"][b]:
+                if not p["done"][b]:
                     mv += p["shares"][b] * p["last_close"]
         equity_rows.append({
             "日期": date.strftime("%Y-%m-%d"),
@@ -584,20 +567,19 @@ def run_one_model(config, args, mode):
             "持仓数": len(positions),
         })
 
-    # 结束强制平仓
-    last_date, last_di = trade_dates[-1], len(trade_dates) - 1
-    for pos in list(positions):
-        for b in ("b1", "b2"):
-            if not pos["batch_done"][b]:
-                do_sell(pos, last_date, pos["last_close"], "回测结束平仓", last_di, b, pos["shares"][b])
-                pos["batch_done"][b] = True
-        positions.remove(pos)
-
-    if equity_rows:
-        equity_rows[-1]["现金"] = round(cash, 2)
-        equity_rows[-1]["持仓市值"] = 0.0
-        equity_rows[-1]["总权益"] = round(cash, 2)
-        equity_rows[-1]["持仓数"] = 0
+    if positions:
+        last_date = trade_dates[-1]
+        last_di = len(trade_dates) - 1
+        for pos in list(positions):
+            for b in ("b1", "b2"):
+                if not pos["done"][b]:
+                    do_sell(pos, last_date, pos["last_close"], "回测结束平仓", last_di, b)
+            positions.remove(pos)
+        if equity_rows:
+            equity_rows[-1]["现金"] = round(cash, 2)
+            equity_rows[-1]["持仓市值"] = 0.0
+            equity_rows[-1]["总权益"] = round(cash, 2)
+            equity_rows[-1]["持仓数"] = 0
 
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_rows)
@@ -627,7 +609,7 @@ def run_one_model(config, args, mode):
         "年化收益率%": round(annualized, 2) if np.isfinite(annualized) else None,
         "最大回撤%": round(max_dd, 2),
         "交易批次数": len(trades_df),
-        "买入滑点": f"{base_slippage:.4%}" + (f" + 尾盘额外 {tail_extra_slippage:.4%}" if mode == "tail" else ""),
+        "买入滑点": f"{base_slippage:.4%}" + (f" + 尾盘额外 {tail_extra:.4%}" if mode == "tail" else ""),
         "佣金率": f"{commission_rate:.4%}",
         "卖出印花税": f"{stamp_rate:.4%}",
     }
@@ -658,16 +640,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
-    parser.add_argument("--cash", type=float, default=40000, help="总资金，默认40000")
+    parser.add_argument("--cash", type=float, default=40000)
     parser.add_argument("--max-positions", type=int, default=2)
-    parser.add_argument("--stop-loss-pct", type=float, default=1.5, help="止损百分比，默认1.5")
+    parser.add_argument("--stop-loss-pct", type=float, default=1.5)
+    parser.add_argument("--max-hold-days", type=int, default=0,
+                        help="最长持有交易日，0=不强制，只靠止盈止损退出")
     parser.add_argument("--min-score", type=float, default=None)
-    parser.add_argument("--max-stocks", type=int, default=0, help="限制股票池数量，0=全市场")
+    parser.add_argument("--max-stocks", type=int, default=0)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--history-days", type=int, default=450)
-    parser.add_argument("--slippage", type=float, default=0.0005, help="基础单边滑点")
-    parser.add_argument("--tail-extra-slippage", type=float, default=0.001,
-                        help="尾盘模型额外滑点，默认0.10%")
+    parser.add_argument("--slippage", type=float, default=0.0005)
+    parser.add_argument("--tail-extra-slippage", type=float, default=0.001)
     parser.add_argument("--commission", type=float, default=0.00025)
     parser.add_argument("--stamp", type=float, default=0.0005)
     parser.add_argument("--cache-dir", default=CACHE_DIR)
