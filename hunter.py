@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【核心修改】并发数设为 2，提速但保留安全空间
-MAX_WORKERS = 2
+# 【提速修改】并发数提升到 4，加快扫描速度
+MAX_WORKERS = 4
 
 TOP_N = 3
 MIN_SCORE = 0.0
@@ -132,9 +132,6 @@ def calculate_indicators(df):
     if vol_col: df["_volume"] = pd.to_numeric(df[vol_col], errors="coerce")
 
     return df
-
-
-# ========== 已彻底移除 15 分钟请求 ==========
 
 
 def market_temperature(snapshot):
@@ -360,8 +357,7 @@ def apply_learned_penalties(candidates):
 
 def fetch_hist(code, today_compact):
     try:
-        # 【核心修改】加入随机 0.2~0.5 秒的休眠，模拟真人操作，防封
-        time.sleep(random.uniform(0.2, 0.5))
+        # 【提速修改】彻底移除 sleep 休眠
         hist = data_source.get_history(code, CONFIG)
         if hist is not None and len(hist) >= 60: return hist
         raise RuntimeError("历史行情为空或不足60条")
@@ -409,7 +405,6 @@ def process_single_stock(row, today_compact, board_map=None):
         support_dist = ((price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan)
         resistance_dist = ((resistance / price - 1) * 100 if (np.isfinite(resistance) and price > 0) else np.nan)
 
-        # 已彻底移除 15 分钟数据获取
         m15_volume_trend = "基于日线综合"
         m15_macd = np.nan
         m15_rsi = np.nan
@@ -417,7 +412,6 @@ def process_single_stock(row, today_compact, board_map=None):
         score = 0.0
         reasons, risks = [], []
 
-        # ===== 日线指标评分（完全保留） =====
         if price >= ma5 and price >= ma10: score += 0.8; reasons.append("价格站在MA5/MA10上方")
         elif price >= ma20: score += 0.35
         else: risks.append("价格低于MA20")
@@ -674,7 +668,7 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，并发数={MAX_WORKERS}）")
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（并发数={MAX_WORKERS}，全速扫描）")
 
     market_stats = market_temperature(spot_all)
     sector_df, sector_status = build_sector_heat(spot_all)
