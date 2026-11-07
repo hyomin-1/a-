@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（东财拉列表 + 腾讯全量K线 极速版）
+A股猎手升级版（生成代码池+纯腾讯全量接口 终极版）
 """
 import os
 import re
@@ -20,7 +20,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【终极提速】并发拉到 15，超时 1.5 秒，绝不卡死
 MAX_WORKERS = 15
 TOP_N = 3
 
@@ -101,16 +100,15 @@ def calculate_indicators(df):
     return df
 
 
-# ================= 纯腾讯/新浪 历史K线接口 =================
+# ================= 纯腾讯 历史K线接口 =================
 
-def fetch_hist_tencent(code):
+def fetch_hist(code):
     market = "sh" if str(code).startswith(("6", "9")) else "sz"
     symbol = f"{market}{code}"
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{symbol},day,,,120,qfq"}
     try:
-        # 1.5 秒极速超时断臂，拿不到直接切新浪
-        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(1.5, 1.5))
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
         resp.raise_for_status()
         data = resp.json()
         node = data.get("data", {}).get(symbol, {})
@@ -130,31 +128,6 @@ def fetch_hist_tencent(code):
     except Exception:
         pass
     return None
-
-def fetch_hist_sina(code):
-    market = "sh" if str(code).startswith(("6", "9")) else "sz"
-    symbol = f"{market}{code}"
-    url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=120"
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(1.5, 1.5))
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows: return None
-        
-        df = pd.DataFrame(rows)
-        df = df.rename(columns={"day": "date", "open": "open", "close": "close", "high": "high", "low": "low", "volume": "volume"})
-        df["date"] = pd.to_datetime(df["date"])
-        for c in ("open", "close", "high", "low", "volume"): df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-        if len(df) >= 60: return df
-    except Exception:
-        pass
-    return None
-
-def fetch_hist(code):
-    df = fetch_hist_tencent(code)
-    if df is not None: return df
-    return fetch_hist_sina(code)
 
 # =========================================================
 
@@ -249,34 +222,61 @@ def process_single_stock(row):
 
 
 def get_full_market_snapshot():
-    log("使用东方财富列表接口获取全市场 5000+ 只代码（仅此一次请求，防封）...")
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": "6000", "po": "1", "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2", "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields": "f2,f3,f6,f8,f10,f12,f14"
-    }
-    try:
-        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        data = resp.json()
-        items = data.get("data", {}).get("diff")
-        if not items: raise RuntimeError("东财快照列表为空")
+    log("正在生成全市场代码池并获取腾讯实时行情（纯本地生成，绝不截断）...")
+    
+    # 自己生成全市场代码，绕过接口的截断
+    code_list = []
+    # 沪市主板 600-605
+    for i in range(600000, 606000):
+        code_list.append(f"sh{i}")
+    # 深市主板 000-003
+    for i in range(1, 4000):
+        code_list.append(f"sz{str(i).zfill(6)}")
+    # 创业板 300-301
+    for i in range(300000, 302000):
+        code_list.append(f"sz{i}")
+    
+    quotes = []
+    batch_size = 60
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    def fetch_batch(batch):
+        url = f"https://qt.gtimg.cn/q={','.join(batch)}"
+        res = []
+        try:
+            # 1.5秒超时，腾讯批量接口极快
+            resp = requests.get(url, headers=headers, timeout=(1.5, 1.5))
+            resp.encoding = "gb18030"
+            lines = resp.text.split(";")
+            for line in lines:
+                if "=" not in line: continue
+                parts = line.split("~")
+                if len(parts) > 49:
+                    code = parts[2]
+                    price = safe_float(parts[3])
+                    if price > 0:  # 过滤停牌和无效代码
+                        res.append({
+                            "代码": code, "名称": parts[1], 
+                            "最新价": price,
+                            "涨跌幅": safe_float(parts[32]), 
+                            "成交额": safe_float(parts[37]), 
+                            "换手率": safe_float(parts[38]), 
+                            "量比": safe_float(parts[49])
+                        })
+        except Exception:
+            pass
+        return res
         
-        rows = []
-        for it in items:
-            rows.append({
-                "代码": str(it.get("f12", "")), "名称": str(it.get("f14", "")),
-                "最新价": it.get("f2"), "涨跌幅": it.get("f3"),
-                "成交额": it.get("f6"), "换手率": it.get("f8"), "量比": it.get("f10")
-            })
-        spot = pd.DataFrame(rows)
-        for col in ["最新价", "涨跌幅", "成交额", "换手率", "量比"]:
-            spot[col] = pd.to_numeric(spot[col], errors="coerce")
+    batches = [code_list[i:i+batch_size] for i in range(0, len(code_list), batch_size)]
+    
+    # 并发拉取实时行情
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_batch, b) for b in batches]
+        for f in as_completed(futures):
+            quotes.extend(f.result())
             
-        return spot
-    except Exception as exc:
-        raise RuntimeError(f"全市场列表获取失败: {exc}")
+    log(f"腾讯实时行情拉取完成，实际有效股票数：{len(quotes)} 只")
+    return pd.DataFrame(quotes)
 
 
 def scan_market():
@@ -291,7 +291,7 @@ def scan_market():
     code = spot["纯代码"]
     name = spot["名称"].astype(str)
     
-    # 严格剔除科创板(688/689)和北交所
+    # 剔除科创板(688/689)和北交所(代码不以6/0/3开头)
     is_sz_sh = code.str.match(r"^(000|001|002|003|300|301|600|601|603|605)")
     limit_pct = np.where(code.str.startswith(("300", "301")), 20.0, 10.0)
 
@@ -301,7 +301,6 @@ def scan_market():
     log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，已剔除科创板）")
 
     candidates = []
-    errors = []
     total = len(spot)
     success = 0
     failed = 0
