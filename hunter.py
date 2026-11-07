@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（纯新浪/腾讯接口版）
+A股猎手升级版（腾讯/东财/新浪 全量备用接口版）
 策略：14:50尾盘观察买入，次日9:30—9:40退出评估
 """
 import os
@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【提速修改】并发数提升到 4，加快扫描速度
+# 并发数
 MAX_WORKERS = 4
 
 TOP_N = 3
@@ -131,6 +131,142 @@ def calculate_indicators(df):
     if open_col: df["_open"] = pd.to_numeric(df[open_col], errors="coerce")
     if vol_col: df["_volume"] = pd.to_numeric(df[vol_col], errors="coerce")
 
+    return df
+
+
+def get_headers():
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15"
+    ]
+    return {"User-Agent": random.choice(uas), "Referer": "https://finance.qq.com/"}
+
+# ================= 接口清单数据源 =================
+
+def fetch_tencent_15m(code):
+    market = "sh" if str(code).startswith(("6", "9")) else "sz"
+    symbol = f"{market}{code}"
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+    params = {"param": f"{symbol},m15,,,160,qfq"}
+    try:
+        resp = requests.get(url, params=params, headers=get_headers(), timeout=3)
+        resp.raise_for_status()
+        payload = resp.json()
+        node = payload.get("data", {}).get(symbol, {})
+        rows = node.get("m15") or node.get("qfq_m15") or []
+        if not rows: return None
+        df = pd.DataFrame(rows).iloc[:, :6]
+        df.columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
+        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["收盘"]).reset_index(drop=True)
+    except Exception:
+        return None
+
+def fetch_eastmoney_15m(code):
+    """东方财富 15分钟 K线 (kline/get)"""
+    secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid, "klt": "15", "fqt": "1",
+        "fields1": "f1,f2,f3,f7", "fields2": "f51,f52,f53,f54,f55,f56",
+        "limit": "160", "ut": "bd1d9ddb04089700cf9c27f6f7426281"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        klines = data.get("data", {}).get("klines")
+        if not klines: return None
+        rows = [k.split(",")[:6] for k in klines if len(k.split(",")) >= 6]
+        df = pd.DataFrame(rows, columns=["时间", "开盘", "收盘", "最高", "最低", "成交量"])
+        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["收盘"]).reset_index(drop=True)
+    except Exception:
+        return None
+
+def fetch_eastmoney_1m(code):
+    """东方财富 1分钟分时 (trends2/get)，转成 15 分钟"""
+    secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
+    url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "secid": secid, "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58", "iscr": "0", "ndays": "5", "ut": "fa5fd1943c7b386f172d6893dbfba10b"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        trends = data.get("data", {}).get("trends")
+        if not trends: return None
+        
+        rows = []
+        for t in trends:
+            parts = t.split(",")
+            if len(parts) >= 6:
+                rows.append([parts[0], float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])])
+                
+        df = pd.DataFrame(rows, columns=["时间", "开盘", "收盘", "最高", "最低", "成交量"])
+        df["时间"] = pd.to_datetime(df["时间"])
+        df = df.set_index("时间")
+        # 将 1 分钟重采样为 15 分钟，兼容原有 MACD 计算逻辑
+        df_15 = df.resample('15min').agg({
+            '开盘': 'first', '收盘': 'last', '最高': 'max', '最低': 'min', '成交量': 'sum'
+        }).dropna()
+        return df_15.reset_index()
+    except Exception:
+        return None
+
+def fetch_sina_30m(code):
+    """新浪 30分钟线"""
+    market = "sh" if str(code).startswith(("6", "9")) else "sz"
+    symbol = f"{market}{code}"
+    url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=30&ma=no&datalen=80"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows: return None
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"day": "时间", "open": "开盘", "close": "收盘", "high": "最高", "low": "最低", "volume": "成交量"})
+        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["收盘"]).reset_index(drop=True)
+    except Exception:
+        return None
+
+# =================================================
+
+def fetch_intraday_15m(code):
+    """
+    多源智能极速切换 (腾讯 -> 东财15m -> 东财1m合成 -> 新浪30m)
+    """
+    # 1. 腾讯
+    df = fetch_tencent_15m(code)
+    if df is not None and len(df) >= 30:
+        pass
+    else:
+        # 2. 东方财富 15m
+        df = fetch_eastmoney_15m(code)
+        if df is None or len(df) < 30:
+            # 3. 东方财富 1m 合成 15m
+            df = fetch_eastmoney_1m(code)
+            if df is None or len(df) < 10:
+                # 4. 新浪 30m (如果前面全挂)
+                df = fetch_sina_30m(code)
+                
+    if df is None or len(df) < 10:
+        return None
+
+    close = df["收盘"]
+    # 如果使用了 30 分钟线，MACD 参数保持 12/26/9 不变，形态依然有效
+    dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    df["DIF"] = dif
+    df["DEA"] = dea
+    df["MACD"] = 2 * (dif - dea)
+    df["RSI15"] = calculate_rsi(close, 14)
     return df
 
 
@@ -356,13 +492,48 @@ def apply_learned_penalties(candidates):
 
 
 def fetch_hist(code, today_compact):
+    """日线多源获取 (腾讯 -> 东财 kline/get)"""
     try:
-        # 【提速修改】彻底移除 sleep 休眠
+        # 先试 data_source.py 里的腾讯
         hist = data_source.get_history(code, CONFIG)
-        if hist is not None and len(hist) >= 60: return hist
-        raise RuntimeError("历史行情为空或不足60条")
+        if hist is not None and len(hist) >= 60: 
+            return hist
+    except Exception:
+        pass
+
+    # 兜底：东财日线
+    secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid, "klt": "101", "fqt": "1",
+        "fields1": "f1,f2,f3,f7", "fields2": "f51,f52,f53,f54,f55,f56",
+        "limit": "120", "ut": "bd1d9ddb04089700cf9c27f6f7426281"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        resp.raise_for_status()
+        data = resp.json()
+        klines = data.get("data", {}).get("klines")
+        if not klines:
+            raise RuntimeError("东财历史行情为空")
+        
+        rows = []
+        for k in klines:
+            parts = k.split(",")
+            # 日期,开盘,收盘,最高,最低,成交量
+            if len(parts) >= 6:
+                rows.append({"date": parts[0], "open": parts[1], "close": parts[2], "high": parts[3], "low": parts[4], "volume": parts[5], "amount": 0})
+        
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        for c in ("open", "close", "high", "low", "volume", "amount"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+        if len(df) < 60:
+            raise RuntimeError("东财历史行情不足60条")
+        return df
     except Exception as exc:
-        raise RuntimeError(f"历史行情获取失败：{exc}")
+        raise RuntimeError(f"历史行情获取失败（腾讯+东财）：{exc}")
 
 
 def process_single_stock(row, today_compact, board_map=None):
@@ -405,12 +576,37 @@ def process_single_stock(row, today_compact, board_map=None):
         support_dist = ((price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan)
         resistance_dist = ((resistance / price - 1) * 100 if (np.isfinite(resistance) and price > 0) else np.nan)
 
-        m15_volume_trend = "基于日线综合"
-        m15_macd = np.nan
-        m15_rsi = np.nan
+        intraday = fetch_intraday_15m(code)
+        m15_macd, m15_prev, m15_dif, m15_dea, m15_rsi = np.nan, np.nan, np.nan, np.nan, np.nan
+        m15_volume_trend = "分钟数据不可用"
+
+        if intraday is not None and len(intraday) >= 3:
+            ilast = intraday.iloc[-1]
+            iprev = intraday.iloc[-2]
+            m15_macd = safe_float(ilast.get("MACD"))
+            m15_prev = safe_float(iprev.get("MACD"))
+            m15_dif = safe_float(ilast.get("DIF"))
+            m15_dea = safe_float(ilast.get("DEA"))
+            m15_rsi = safe_float(ilast.get("RSI15"))
+            v = pd.to_numeric(intraday["成交量"].tail(6), errors="coerce")
+            if len(v) >= 6 and v.iloc[-3:].mean() > v.iloc[:3].mean(): m15_volume_trend = "尾盘量能增强"
+            elif len(v) >= 6: m15_volume_trend = "尾盘量能平稳/减弱"
 
         score = 0.0
         reasons, risks = [], []
+
+        if np.isfinite(m15_macd) and np.isfinite(m15_prev):
+            if m15_macd > m15_prev: score += 1.1; reasons.append("15分钟MACD改善")
+            else: risks.append("15分钟MACD走弱")
+            if np.isfinite(m15_dif) and np.isfinite(m15_dea) and m15_dif > m15_dea: score += 0.7; reasons.append("15分钟MACD处于多头")
+            else: risks.append("15分钟MACD未形成多头")
+        else: risks.append("缺少15分钟数据，尾盘信号不完整")
+
+        if np.isfinite(m15_rsi):
+            if 48 <= m15_rsi <= 68: score += 0.8; reasons.append("15分钟RSI强度适中")
+            elif 42 <= m15_rsi < 48: score += 0.35
+            elif m15_rsi >= 78: risks.append("15分钟RSI过热")
+        else: risks.append("15分钟RSI不可用")
 
         if price >= ma5 and price >= ma10: score += 0.8; reasons.append("价格站在MA5/MA10上方")
         elif price >= ma20: score += 0.35
@@ -442,13 +638,17 @@ def process_single_stock(row, today_compact, board_map=None):
             if resistance_dist <= 1.2: risks.append("临近20/60日压力位，突破空间有限")
             elif resistance_dist >= 2.5: score += 0.45; reasons.append("上方短期压力空间尚可")
 
+        if np.isfinite(support_dist) and support_dist <= 2.0 and m15_volume_trend == "尾盘量能增强": score += 0.35; reasons.append("支撑附近出现量能增强")
+        if m15_volume_trend == "尾盘量能增强": score += 0.25
+
         limit_pct = (20.0 if code.startswith(("300", "301")) else 10.0)
         if pct <= -10.0 or pct >= limit_pct - 0.15 or price > 800: return None
 
         for risk, penalty in [
+            ("15分钟MACD走弱", 0.6), ("15分钟MACD未形成多头", 0.4), ("15分钟RSI过热", 0.5),
             ("价格低于MA20", 0.6), ("日线中期趋势偏弱", 0.4), ("当日涨幅过大，隔夜追高风险", 0.8),
             ("量比过高，警惕尾盘分歧", 0.5), ("换手率异常偏高", 0.4), ("临近20/60日压力位，突破空间有限", 0.8),
-            ("距离下方支撑较远", 0.3)
+            ("距离下方支撑较远", 0.3), ("缺少15分钟数据，尾盘信号不完整", 0.8)
         ]:
             if risk in risks: score -= penalty
 
@@ -466,9 +666,9 @@ def process_single_stock(row, today_compact, board_map=None):
             "量比": round(volume_ratio, 2),
             "日线MACD": round(daily_macd, 4) if np.isfinite(daily_macd) else np.nan,
             "日线RSI": round(daily_rsi, 1) if np.isfinite(daily_rsi) else np.nan,
-            "15分钟MACD": np.nan,
-            "15分钟RSI": np.nan,
-            "尾盘量能": "基于日线综合",
+            "15分钟MACD": round(m15_macd, 4) if np.isfinite(m15_macd) else np.nan,
+            "15分钟RSI": round(m15_rsi, 1) if np.isfinite(m15_rsi) else np.nan,
+            "尾盘量能": m15_volume_trend,
             "支撑位": round(support, 3) if np.isfinite(support) else np.nan,
             "压力位": round(resistance, 3) if np.isfinite(resistance) else np.nan,
             "距支撑%": round(support_dist, 2) if np.isfinite(support_dist) else np.nan,
@@ -534,18 +734,62 @@ def build_fallback_candidates(spot, existing, top_n=3):
     return fallback_rows[:max(0, top_n - len(existing))]
 
 
+def fetch_eastmoney_snapshot():
+    """东方财富全市场快照兜底 (clist/get)"""
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": "6000", "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f2,f3,f6,f8,f10,f12,f14"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data", {}).get("diff")
+        if not items: return None
+        
+        rows = []
+        for it in items:
+            rows.append({
+                "代码": str(it.get("f12", "")), "名称": str(it.get("f14", "")),
+                "最新价": it.get("f2"), "涨跌幅": it.get("f3"),
+                "成交额": it.get("f6"), "换手率": it.get("f8"), "量比": it.get("f10")
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return None
+
 def get_spot_snapshot():
-    log("使用新浪/腾讯接口获取全市场快照...")
+    log("获取全市场实时快照...")
     data_source.reset_data_source_status()
-    snapshot = data_source.get_market_snapshot(CONFIG)
-    if not snapshot: raise RuntimeError("实时快照接口返回空数据")
-    spot = pd.DataFrame(snapshot)
-    spot = spot.rename(columns={"code": "代码", "name": "名称", "price": "最新价", "change_pct": "涨跌幅", "amount": "成交额", "turnover_rate": "换手率"})
+    spot = None
+    
+    # 1. 先用原有的新浪/腾讯
+    try:
+        snapshot = data_source.get_market_snapshot(CONFIG)
+        if snapshot: spot = pd.DataFrame(snapshot)
+    except Exception:
+        pass
+
+    # 2. 数据不全或失败，切东财快照
+    if spot is None or len(spot) < 1000:
+        log("新浪/腾讯快照失败，切换东财快照...")
+        spot = fetch_eastmoney_snapshot()
+
+    if spot is None or spot.empty:
+        raise RuntimeError("所有快照接口均返回空数据")
+
+    if "code" in spot.columns: # 兼容原 data_source 返回的英文字段
+        spot = spot.rename(columns={"code": "代码", "name": "名称", "price": "最新价", "change_pct": "涨跌幅", "amount": "成交额", "turnover_rate": "换手率"})
+
     for col in ["量比", "委比", "外盘", "内盘"]:
         if col not in spot.columns: spot[col] = np.nan
     for col in ["最新价", "涨跌幅", "成交额", "量比", "委比", "外盘", "内盘", "换手率"]:
         if col in spot.columns: spot[col] = pd.to_numeric(spot[col], errors="coerce")
-    return spot, "sina_tencent"
+        
+    return spot, "multi_source"
 
 
 def review_previous_picks(previous_date, previous_df, current_spot):
@@ -644,7 +888,6 @@ def scan_market():
     today = now.strftime("%Y-%m-%d")
     today_compact = now.strftime("%Y%m%d")
 
-    log("获取全市场实时快照...")
     spot, snapshot_source = get_spot_snapshot()
     spot_all = spot.copy()
 
@@ -668,7 +911,7 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（并发数={MAX_WORKERS}，全速扫描）")
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场扫描，并发数={MAX_WORKERS}）")
 
     market_stats = market_temperature(spot_all)
     sector_df, sector_status = build_sector_heat(spot_all)
