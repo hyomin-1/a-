@@ -1,0 +1,58 @@
+name: A股猎手-双模型年度回测
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: '回测开始日期 (YYYY-MM-DD)'
+        required: true
+        default: '2025-11-07'
+      end_date:
+        description: '回测结束日期 (YYYY-MM-DD)'
+        required: true
+        default: '2026-11-07'
+      max_stocks:
+        description: '限制股票池数量 (0为全市场，测试可填500)'
+        required: true
+        default: '0'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    # 全市场下载历史数据耗时较长，设置一个较长的超时时间（3小时）
+    timeout-minutes: 180
+
+    steps:
+      - name: 获取项目代码
+        uses: actions/checkout@v4
+
+      - name: 配置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 检查代码语法
+        run: |
+          python -m py_compile backtest_dual.py
+
+      - name: 执行双模型回测
+        # 使用你在页面上输入的参数
+        run: |
+          python backtest_dual.py --start ${{ github.event.inputs.start_date }} --end ${{ github.event.inputs.end_date }} --max-stocks ${{ github.event.inputs.max_stocks }}
+
+      - name: 上传回测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-reports
+          # 打包回测生成的所有文件（汇总、明细、资金曲线）
+          path: reports/backtest_dual/
+          retention-days: 7
