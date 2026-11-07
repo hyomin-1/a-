@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（纯日线极速版）
+A股猎手升级版（纯日线极速全量版）
 策略：14:50尾盘观察买入，次日9:30—9:40退出评估
 交易规则：
 1. 输出综合评分前三名，前两名为买入候选，第三名备用。
@@ -28,14 +28,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【提速修改】默认并发提高到 4，只请求日线，速度极快
+# 并发数保持 4，纯日线请求速度快，防封
 MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "4"))
 TOP_N = 3
 MIN_SCORE = 0.0
 HISTORY_DAYS = 120
-
-TOP_INDUSTRY_BOARDS = 12
-TOP_CONCEPT_BOARDS = 12
 
 
 def load_config():
@@ -167,9 +164,6 @@ def calculate_indicators(df):
         )
 
     return df
-
-
-# ========== 已彻底移除 15 分钟 K 线请求 ==========
 
 
 def market_temperature(snapshot):
@@ -789,7 +783,6 @@ def apply_learned_penalties(candidates):
 
 def fetch_hist(code, today_compact):
     try:
-        # 调用 data_source.py 里的腾讯历史K线接口
         hist = data_source.get_history(code, CONFIG)
         if hist is not None and len(hist) >= 60:
             return hist
@@ -867,8 +860,6 @@ def process_single_stock(
             row.get("成交额"), np.nan
         )
 
-        # 使用前一交易日数据计算支撑压力，
-        # 避免将今天未收盘的高低点当成确定压力位。
         prev_hist = hist.iloc[:-1].tail(60)
 
         high_col = get_col(
@@ -946,7 +937,7 @@ def process_single_stock(
             else np.nan
         )
 
-        # 【核心修改】将 15 分钟指标全部置为不可用，不再发起任何网络请求
+        # 【核心修改】彻底移除 15 分钟请求，使用日线兜底逻辑
         m15_macd = np.nan
         m15_prev = np.nan
         m15_dif = np.nan
@@ -958,7 +949,6 @@ def process_single_stock(
         reasons = []
         risks = []
 
-        # 盘中评分权重高于日线MACD。
         if (
             np.isfinite(m15_macd)
             and np.isfinite(m15_prev)
@@ -1105,7 +1095,7 @@ def process_single_stock(
         limit_pct = (
             20.0
             if code.startswith(
-                ("300", "301", "688", "689")
+                ("300", "301")
             )
             else 10.0
         )
@@ -1116,7 +1106,6 @@ def process_single_stock(
         if price > 800:
             return None
 
-        # 风险扣分。
         for risk, penalty in [
             ("15分钟MACD走弱", 0.6),
             ("15分钟MACD未形成多头", 0.4),
@@ -1138,8 +1127,6 @@ def process_single_stock(
             min(10.0, score)
         )
 
-        # 交易计划以扫描时参考价计算。
-        # 实际买入后必须按实际成交均价重新计算。
         target_10 = round(price * 1.01, 2)
         target_20 = round(price * 1.02, 2)
 
@@ -1156,7 +1143,6 @@ def process_single_stock(
             )
         )
 
-        # A股买入按100股整数倍向下取整。
         planned_shares = (
             int(capital_per_stock / price / 100)
             * 100
@@ -1259,10 +1245,6 @@ def build_fallback_candidates(
     existing,
     top_n=3
 ):
-    """
-    深度行情失败时，用实时快照补足排名。
-    缺失指标明确标记，不伪造技术数据。
-    """
     existing_codes = {
         normalize_code(x.get("代码"))
         for x in existing
@@ -1300,7 +1282,7 @@ def build_fallback_candidates(
         limit_pct = (
             20.0
             if code.startswith(
-                ("300", "301", "688", "689")
+                ("300", "301")
             )
             else 10.0
         )
@@ -1434,7 +1416,6 @@ def get_spot_snapshot():
         
     spot = pd.DataFrame(snapshot)
     
-    # 适配原有的列名，保证后面的核心逻辑不报错
     spot = spot.rename(columns={
         "code": "代码",
         "name": "名称",
@@ -1444,7 +1425,6 @@ def get_spot_snapshot():
         "turnover_rate": "换手率"
     })
     
-    # 补充 data_source 中不存在的字段（防止后面报错）
     for col in ["量比", "委比", "外盘", "内盘"]:
         if col not in spot.columns:
             spot[col] = np.nan
@@ -1592,7 +1572,6 @@ def write_report(
     sector_df,
     sector_status
 ):
-    """输出简洁卡片式Markdown报告。"""
     ensure_dirs()
 
     lines = [
@@ -1908,15 +1887,15 @@ def scan_market():
     code = spot["纯代码"].astype(str)
     name = spot["名称"].astype(str)
 
-    # 沪深主板+创业板+科创板。
-    # 排除北交所、ST、退市。
+    # 【核心修改】已剔除 688（科创）和 689，仅保留沪深主板+创业板。
+    # 北交所（8/4开头）天然不在匹配范围内。
     is_sz_sh = code.str.match(
-        r"^(000|001|002|003|300|301|600|601|603|605|688|689)"
+        r"^(000|001|002|003|300|301|600|601|603|605)"
     )
 
     limit_pct = np.where(
         code.str.startswith(
-            ("300", "301", "688", "689")
+            ("300", "301")
         ),
         20.0,
         10.0
@@ -1940,30 +1919,14 @@ def scan_market():
         )
     ].copy()
 
-    # 不设成交额门槛。
-    # 仅按成交额排序控制请求数量。
-    spot["_amount_sort"] = (
-        spot["成交额"].fillna(0)
-    )
-
-    max_candidates = int(
-        CONFIG.get(
-            "screening", {}
-        ).get("shortlist_size", 9999)
-    )
-
-    spot = (
-        spot.sort_values(
-            "_amount_sort",
-            ascending=False
-        )
-        .head(max_candidates)
-        .drop(columns=["_amount_sort"])
+    # 【核心修改】彻底删除数量限制，不再截断，全市场扫描
+    spot = spot.sort_values(
+        "成交额", ascending=False
     )
 
     log(
         f"基础过滤后进入深度分析：{len(spot)} 只"
-        "（无成交额准入门槛）"
+        "（已剔除科创板/北交所，全市场深度扫描）"
     )
 
     market_stats = market_temperature(
@@ -2054,7 +2017,7 @@ def scan_market():
                     )
                 })
 
-            if completed % 50 == 0 or completed == total:
+            if completed % 100 == 0 or completed == total:
                 log(
                     f"进度：{completed}/{total}；"
                     f"有效候选 {len(candidates)}；"
@@ -2081,8 +2044,6 @@ def scan_market():
         ).get("top_n", 3)
     )
 
-    # 深度分析成功的股票优先。
-    # 不足3只时，从实时快照中补足低置信度备选。
     if candidates:
         candidates = apply_learned_penalties(
             candidates
@@ -2126,7 +2087,6 @@ def scan_market():
             encoding="utf-8-sig"
         )
 
-        # 保留历史推荐记录，不覆盖旧记录。
         history_path = os.path.join(
             REPORT_DIR,
             "recommendation_history.csv"
