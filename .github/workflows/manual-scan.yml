@@ -45,5 +45,7 @@ jobs:
             echo "没有新的报告需要保存"
           else
             git commit -m "更新A股猎手报告和复盘记录"
+            # 【核心修复】先拉取远端最新代码解决冲突，再推送
+            git pull --rebase origin ${GITHUB_REF_NAME}
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
