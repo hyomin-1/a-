@@ -1,10 +1,10 @@
 {
-  "version": "overnight-scalp-v3-15m",
+  "version": "ashare-hunter-v4-100pts",
   "market": {
     "include_shanghai": true,
     "include_shenzhen": true,
     "include_chinext": true,
-    "include_star_market": true,
+    "include_star_market": false,
     "include_beijing": false,
     "exclude_st": true,
     "exclude_delisting": true
@@ -12,7 +12,6 @@
   "data_source": {
     "primary": "sina",
     "history": "tencent",
-    "intraday": "tencent_15m",
     "max_workers": 8,
     "request_timeout_seconds": 10
   },
@@ -22,51 +21,20 @@
     "min_price": 0,
     "max_price": 800,
     "min_day_pct": -10,
-    "exclude_limit_up": true,
-    "amount_minimum": 0,
-    "min_score": 0
+    "exclude_limit_up": true
   },
-  "indicators": {
-    "daily_macd_role": "trend_filter_only",
-    "intraday_macd_period": "15m",
-    "intraday_rsi_period": 14,
-    "ma_periods": [
-      5,
-      10,
-      20,
-      60
-    ],
-    "support_resistance_lookback": [
-      20,
-      60
-    ]
+  "v4_params": {
+    "atr_period": 14,
+    "atr_stop_multiplier": 1.5,
+    "ma_periods": [5, 10, 20, 60]
   },
   "learning": {
     "enabled": true,
-    "review_previous_recommendations": true,
     "persist_reports": true
   },
   "output": {
     "directory": "reports",
     "save_candidates": true,
-    "save_top3": true,
-    "save_market_heat": true,
-    "save_sector_heat": true,
-    "save_learning": true,
-    "compact_report": true
-  },
-  "overnight": {
-    "entry_observation_time": "14:50",
-    "exit_observation_window": "09:30-09:40",
-    "profit_scenarios_pct": [
-      0.5,
-      1.0,
-      2.0
-    ],
-    "risk_reference_pct": 0.5,
-    "do_not_force_trade": false,
-    "minimum_take_profit_pct": 0.5,
-    "stop_loss_pct": 0.8,
-    "support_break_buffer_pct": 0.3
+    "save_top3": true
   }
 }
