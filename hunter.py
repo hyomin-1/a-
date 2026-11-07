@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 并发数：为了全市场扫描不被封，保持在 2。如果觉得太慢可以改成 3。
-MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "2"))
+# 并发数提高到 4，加快全市场扫描速度
+MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "4"))
 
 TOP_N = 3
 MIN_SCORE = 0.0
@@ -38,7 +38,6 @@ def load_config():
             return json.load(f)
     except Exception as exc:
         print(f"配置文件读取失败：{exc}，将使用默认全市场配置")
-        # 兜底默认配置，如果配置读不出来，默认扫描全市场
         return {
             "market": {
                 "include_shanghai": True,
@@ -153,7 +152,8 @@ def fetch_tencent_15m(code):
     url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
     params = {"param": f"{symbol},m15,,,160,qfq"}
     try:
-        resp = requests.get(url, params=params, headers=get_headers(), timeout=8)
+        # 超时缩短为 5 秒，防止卡死
+        resp = requests.get(url, params=params, headers=get_headers(), timeout=5)
         resp.raise_for_status()
         payload = resp.json()
         node = payload.get("data", {}).get(symbol, {})
@@ -175,7 +175,7 @@ def fetch_sina_15m(code):
     params = {"symbol": symbol, "scale": "15", "ma": "no", "datalen": "160"}
     headers = {"User-Agent": random.choice(["Mozilla/5.0", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"]), "Referer": "https://finance.sina.com.cn/"}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=8)
+        resp = requests.get(url, params=params, headers=headers, timeout=5)
         resp.raise_for_status()
         text = resp.text
         match = re.search(r"=\s*\((\[.*\])\);", text, re.S)
@@ -192,7 +192,7 @@ def fetch_sina_15m(code):
 
 
 def fetch_intraday_15m(code):
-    time.sleep(random.uniform(0.1, 0.4))
+    # 移除所有 sleep，全速请求
     df = fetch_tencent_15m(code)
     if df is None or len(df) < 30:
         df = fetch_sina_15m(code)
@@ -432,7 +432,6 @@ def apply_learned_penalties(candidates):
 
 def fetch_hist(code, today_compact):
     try:
-        time.sleep(random.uniform(0.1, 0.4))
         hist = data_source.get_history(code, CONFIG)
         if hist is not None and len(hist) >= 60: return hist
         raise RuntimeError("历史行情为空或不足60条")
@@ -480,12 +479,11 @@ def process_single_stock(row, today_compact, board_map=None):
         support_dist = ((price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan)
         resistance_dist = ((resistance / price - 1) * 100 if (np.isfinite(resistance) and price > 0) else np.nan)
 
-        # 如果拿不到15分钟数据，这里会返回 None，不会抛出异常导致整个股票跳过
+        # 拿不到 15 分钟数据返回 None，不抛出异常，直接跳过分钟打分
         intraday = fetch_intraday_15m(code)
         m15_macd, m15_prev, m15_dif, m15_dea, m15_rsi = np.nan, np.nan, np.nan, np.nan, np.nan
         m15_volume_trend = "分钟数据不可用"
 
-        # 只有拿到了 15 分钟数据才计算 15 分钟指标
         if intraday is not None and len(intraday) >= 3:
             ilast = intraday.iloc[-1]
             iprev = intraday.iloc[-2]
@@ -776,12 +774,10 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    spot["_amount_sort"] = spot["成交额"].fillna(0)
-    # 不再强制写死 800，根据配置读取，如果配置没读出来默认 9999 全市场
-    max_candidates = int(CONFIG.get("screening", {}).get("shortlist_size", 9999))
-    spot = spot.sort_values("_amount_sort", ascending=False).head(max_candidates).drop(columns=["_amount_sort"])
-
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场扫描）")
+    # ================= 核心改动 =================
+    # 彻底删除任何数量截断，无视配置文件，全市场拉满
+    # ============================================
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描，无任何数量限制）")
 
     market_stats = market_temperature(spot_all)
     sector_df, sector_status = build_sector_heat(spot_all)
@@ -826,7 +822,6 @@ def scan_market():
     top_n = int(CONFIG.get("screening", {}).get("top_n", 3))
     if candidates: candidates = apply_learned_penalties(candidates)
 
-    # 把全市场抓日线失败的股票，降级扔进实时备选池
     fallback_candidates = build_fallback_candidates(spot, candidates, top_n=top_n)
     candidates.extend(fallback_candidates)
 
