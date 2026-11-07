@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import akshare as ak
+import data_source
 import numpy as np
 import pandas as pd
 
@@ -916,43 +916,14 @@ def apply_learned_penalties(candidates):
 
 
 def fetch_hist(code, today_compact):
-    symbol_tx = (
-        f"sh{code}"
-        if code.startswith("6")
-        else f"sz{code}"
-    )
-
-    start_date = (
-        sh_now() - timedelta(days=HISTORY_DAYS)
-    ).strftime("%Y%m%d")
-
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            hist = ak.stock_zh_a_hist_tx(
-                symbol=symbol_tx,
-                start_date=start_date,
-                end_date=today_compact,
-                adjust="qfq"
-            )
-
-            if hist is not None and len(hist) >= 60:
-                return hist
-
-            last_error = RuntimeError(
-                "历史行情为空或不足60条"
-            )
-
-        except Exception as exc:
-            last_error = exc
-
-        if attempt < 2:
-            time.sleep(0.5)
-
-    raise RuntimeError(
-        f"历史行情获取失败：{last_error}"
-    )
+    try:
+        # 调用 data_source.py 里的腾讯历史K线接口
+        hist = data_source.get_history(code, CONFIG)
+        if hist is not None and len(hist) >= 60:
+            return hist
+        raise RuntimeError("历史行情为空或不足60条")
+    except Exception as exc:
+        raise RuntimeError(f"历史行情获取失败：{exc}")
 
 
 def process_single_stock(
@@ -1631,17 +1602,30 @@ def build_fallback_candidates(
 
 
 def get_spot_snapshot():
-    log("使用新浪接口获取全市场快照...")
-
-    spot = ak.stock_zh_a_spot()
-    source = "stock_zh_a_spot"
-
-    if spot is None or spot.empty:
-        raise RuntimeError(
-            "新浪快照接口返回空数据"
-        )
-
-    spot = spot.copy()
+    log("使用新浪/腾讯接口获取全市场快照...")
+    
+    data_source.reset_data_source_status()
+    snapshot = data_source.get_market_snapshot(CONFIG)
+    
+    if not snapshot:
+        raise RuntimeError("实时快照接口返回空数据")
+        
+    spot = pd.DataFrame(snapshot)
+    
+    # 适配原有的列名，保证后面的核心逻辑不报错
+    spot = spot.rename(columns={
+        "code": "代码",
+        "name": "名称",
+        "price": "最新价",
+        "change_pct": "涨跌幅",
+        "amount": "成交额",
+        "turnover_rate": "换手率"
+    })
+    
+    # 补充 data_source 中不存在的字段（防止后面报错）
+    for col in ["量比", "委比", "外盘", "内盘"]:
+        if col not in spot.columns:
+            spot[col] = np.nan
 
     for col in [
         "最新价",
@@ -1654,13 +1638,9 @@ def get_spot_snapshot():
         "换手率"
     ]:
         if col in spot.columns:
-            spot[col] = pd.to_numeric(
-                spot[col], errors="coerce"
-            )
-        else:
-            spot[col] = np.nan
-
-    return spot, source
+            spot[col] = pd.to_numeric(spot[col], errors="coerce")
+            
+    return spot, "sina_tencent"
 
 
 def review_previous_picks(
