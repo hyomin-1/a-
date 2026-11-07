@@ -2,12 +2,6 @@
 """
 A股猎手升级版（纯新浪/腾讯接口版）
 策略：14:50尾盘观察买入，次日9:30—9:40退出评估
-交易规则：
-1. 输出综合评分前三名，前两名为买入候选，第三名备用。
-2. 每只股票计划资金20,000元。
-3. 盈利+1%卖出持仓50%，盈利+2%卖出剩余全部。
-4. 下跌-1%和-2%触发风险复核，不自动强制清仓。
-5. 本程序只生成选股和交易计划，不连接券商自动下单。
 """
 import os
 import re
@@ -29,8 +23,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 降低并发数，防止被接口封禁
+# 并发数：为了全市场扫描不被封，保持在 2。如果觉得太慢可以改成 3。
 MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "2"))
+
 TOP_N = 3
 MIN_SCORE = 0.0
 HISTORY_DAYS = 120
@@ -42,8 +37,22 @@ def load_config():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:
-        print(f"配置文件读取失败：{exc}")
-        return {}
+        print(f"配置文件读取失败：{exc}，将使用默认全市场配置")
+        # 兜底默认配置，如果配置读不出来，默认扫描全市场
+        return {
+            "market": {
+                "include_shanghai": True,
+                "include_shenzhen": True,
+                "include_chinext": True,
+                "include_star_market": False,
+                "exclude_st": True,
+                "exclude_delisting": True
+            },
+            "screening": {
+                "shortlist_size": 9999, 
+                "top_n": 3
+            }
+        }
 
 
 CONFIG = load_config()
@@ -84,12 +93,8 @@ def get_col(df, candidates, default=None):
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(
-        period, min_periods=period
-    ).mean()
-    loss = (-delta.clip(upper=0)).rolling(
-        period, min_periods=period
-    ).mean()
+    gain = delta.clip(lower=0).rolling(period, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
     rs = gain / loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
     result = result.mask((loss == 0) & (gain > 0), 100)
@@ -97,45 +102,26 @@ def calculate_rsi(series, period=14):
 
 
 def calculate_indicators(df):
-    """日线只作趋势背景：MA5/10/20/60 + 日MACD。"""
     if df is None or df.empty:
         return None
-
     df = df.copy()
     close_col = get_col(df, ["close", "收盘"])
-
     if not close_col:
         return None
-
-    df[close_col] = pd.to_numeric(
-        df[close_col], errors="coerce"
-    )
-    df = df.dropna(
-        subset=[close_col]
-    ).sort_index().reset_index(drop=True)
-
+    df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
+    df = df.dropna(subset=[close_col]).sort_index().reset_index(drop=True)
     if len(df) < 60:
         return None
 
     close = df[close_col]
     df["_close"] = close
-
     for n in (5, 10, 20, 60):
         df[f"MA{n}"] = close.rolling(n).mean()
 
-    ema12 = close.ewm(
-        span=12, adjust=False
-    ).mean()
-
-    ema26 = close.ewm(
-        span=26, adjust=False
-    ).mean()
-
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
     df["DIF"] = ema12 - ema26
-    df["DEA"] = df["DIF"].ewm(
-        span=9, adjust=False
-    ).mean()
-
+    df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD"] = 2 * (df["DIF"] - df["DEA"])
     df["RSI"] = calculate_rsi(close, 14)
 
@@ -144,25 +130,10 @@ def calculate_indicators(df):
     open_col = get_col(df, ["open", "开盘"])
     vol_col = get_col(df, ["volume", "成交量"])
 
-    if high_col:
-        df["_high"] = pd.to_numeric(
-            df[high_col], errors="coerce"
-        )
-
-    if low_col:
-        df["_low"] = pd.to_numeric(
-            df[low_col], errors="coerce"
-        )
-
-    if open_col:
-        df["_open"] = pd.to_numeric(
-            df[open_col], errors="coerce"
-        )
-
-    if vol_col:
-        df["_volume"] = pd.to_numeric(
-            df[vol_col], errors="coerce"
-        )
+    if high_col: df["_high"] = pd.to_numeric(df[high_col], errors="coerce")
+    if low_col: df["_low"] = pd.to_numeric(df[low_col], errors="coerce")
+    if open_col: df["_open"] = pd.to_numeric(df[open_col], errors="coerce")
+    if vol_col: df["_volume"] = pd.to_numeric(df[vol_col], errors="coerce")
 
     return df
 
@@ -177,22 +148,17 @@ def get_headers():
 
 
 def fetch_tencent_15m(code):
-    """腾讯15分钟K线"""
     market = "sh" if str(code).startswith(("6", "9")) else "sz"
     symbol = f"{market}{code}"
     url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
     params = {"param": f"{symbol},m15,,,160,qfq"}
-
     try:
-        resp = requests.get(url, params=params, headers=get_headers(), timeout=10)
+        resp = requests.get(url, params=params, headers=get_headers(), timeout=8)
         resp.raise_for_status()
         payload = resp.json()
         node = payload.get("data", {}).get(symbol, {})
         rows = node.get("m15") or node.get("qfq_m15") or []
-
-        if not rows:
-            return None
-
+        if not rows: return None
         df = pd.DataFrame(rows).iloc[:, :6]
         df.columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
         for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
@@ -203,78 +169,51 @@ def fetch_tencent_15m(code):
 
 
 def fetch_sina_15m(code):
-    """新浪15分钟K线（作为腾讯的备用源）"""
     market = "sh" if str(code).startswith(("6", "9")) else "sz"
     symbol = f"{market}{code}"
     url = f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_{symbol}_15m=/CN_MarketDataService.getKLineData"
     params = {"symbol": symbol, "scale": "15", "ma": "no", "datalen": "160"}
     headers = {"User-Agent": random.choice(["Mozilla/5.0", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"]), "Referer": "https://finance.sina.com.cn/"}
-
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
         resp.raise_for_status()
         text = resp.text
-        
-        # 解析新浪返回的 JSONP 格式
         match = re.search(r"=\s*\((\[.*\])\);", text, re.S)
-        if not match:
-            return None
-            
+        if not match: return None
         rows = json.loads(match.group(1))
-        if not rows:
-            return None
-
+        if not rows: return None
         df = pd.DataFrame(rows)
-        df = df.rename(columns={
-            "day": "时间", "open": "开盘", "close": "收盘",
-            "high": "最高", "low": "最低", "volume": "成交量"
-        })
-        
+        df = df.rename(columns={"day": "时间", "open": "开盘", "close": "收盘", "high": "最高", "low": "最低", "volume": "成交量"})
         for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-            
         return df.dropna(subset=["收盘"]).reset_index(drop=True)
     except Exception:
         return None
 
 
 def fetch_intraday_15m(code):
-    """
-    获取15分钟K线。
-    优先请求腾讯，失败或返回空时，自动降级请求新浪。
-    """
-    # 随机休眠，防止被封 IP
-    time.sleep(random.uniform(0.2, 0.8))
-
+    time.sleep(random.uniform(0.1, 0.4))
     df = fetch_tencent_15m(code)
-    if df is not None and len(df) >= 30:
-        source = "腾讯"
-    else:
+    if df is None or len(df) < 30:
         df = fetch_sina_15m(code)
-        source = "新浪"
-
     if df is None or len(df) < 30:
         return None
 
     close = df["收盘"]
     dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
     dea = dif.ewm(span=9, adjust=False).mean()
-    
     df["DIF"] = dif
     df["DEA"] = dea
     df["MACD"] = 2 * (dif - dea)
     df["RSI15"] = calculate_rsi(close, 14)
-    
     return df
 
 
 def market_temperature(snapshot):
-    """用全市场快照计算热度。"""
     df = snapshot.copy()
     pct = pd.to_numeric(df.get("涨跌幅"), errors="coerce")
     amount = pd.to_numeric(df.get("成交额"), errors="coerce")
     valid = pct.dropna()
-
     if valid.empty:
         return {"上涨家数": 0, "下跌家数": 0, "平盘家数": 0, "上涨比例": 0, "跌停附近": 0, "涨停附近": 0, "成交额亿元": None, "热度": "数据不足"}
 
@@ -286,33 +225,21 @@ def market_temperature(snapshot):
     breadth = up / max(1, len(valid))
     total_amount = float(amount.fillna(0).sum() / 1e8)
 
-    if breadth >= .65 and up_limit >= 50 and down_limit <= 10:
-        mood = "偏热"
-    elif breadth >= .52 and down > 0 and down_limit <= 20:
-        mood = "温和偏强"
-    elif breadth <= .35 or down_limit >= 30:
-        mood = "偏冷"
-    else:
-        mood = "分化"
+    if breadth >= .65 and up_limit >= 50 and down_limit <= 10: mood = "偏热"
+    elif breadth >= .52 and down > 0 and down_limit <= 20: mood = "温和偏强"
+    elif breadth <= .35 or down_limit >= 30: mood = "偏冷"
+    else: mood = "分化"
 
-    return {
-        "上涨家数": up, "下跌家数": down, "平盘家数": flat,
-        "上涨比例": round(breadth * 100, 1), "涨停附近": up_limit,
-        "跌停附近": down_limit, "成交额亿元": round(total_amount, 1), "热度": mood
-    }
+    return {"上涨家数": up, "下跌家数": down, "平盘家数": flat, "上涨比例": round(breadth * 100, 1), "涨停附近": up_limit, "跌停附近": down_limit, "成交额亿元": round(total_amount, 1), "热度": mood}
 
 
 def build_sector_heat(snapshot):
-    if "行业" not in snapshot.columns:
-        return pd.DataFrame(), "行情快照未提供行业字段，板块热度不可计算"
-
+    if "行业" not in snapshot.columns: return pd.DataFrame(), "行情快照未提供行业字段，板块热度不可计算"
     df = snapshot.copy()
     df["涨跌幅"] = pd.to_numeric(df.get("涨跌幅"), errors="coerce")
     df["成交额"] = pd.to_numeric(df.get("成交额"), errors="coerce")
     df = df.dropna(subset=["行业", "涨跌幅"])
-
-    if df.empty:
-        return pd.DataFrame(), "行业字段无有效数据"
+    if df.empty: return pd.DataFrame(), "行业字段无有效数据"
 
     grouped = df.groupby("行业").agg(
         股票数=("代码", "count"),
@@ -320,11 +247,9 @@ def build_sector_heat(snapshot):
         上涨家数=("涨跌幅", lambda x: int((x > 0).sum())),
         成交额亿元=("成交额", lambda x: float(x.fillna(0).sum() / 1e8))
     ).reset_index()
-
     grouped["上涨比例"] = (grouped["上涨家数"] / grouped["股票数"] * 100)
     grouped = grouped.sort_values(["平均涨幅", "上涨比例", "成交额亿元"], ascending=False).head(15)
     grouped["资金净流入"] = "当前数据源未提供，不能确认"
-
     return grouped, "板块热度为行业涨幅/广度/成交额代理，不等于主力资金净流入"
 
 
@@ -332,40 +257,32 @@ def load_previous_picks(today):
     ensure_dirs()
     candidates = []
     run_dir = os.path.join(REPORT_DIR, "runs")
-
     if os.path.isdir(run_dir):
         for filename in os.listdir(run_dir):
             match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})_(\d{6})\.csv", filename)
             if match and match.group(1) < today:
                 candidates.append((match.group(1) + " " + match.group(2), os.path.join(run_dir, filename)))
-
     if candidates:
         stamp, path = sorted(candidates, reverse=True)[0]
         try:
             df = pd.read_csv(path, dtype={"代码": str})
-            if not df.empty and "代码" in df.columns:
-                df["代码"] = df["代码"].map(normalize_code)
+            if not df.empty and "代码" in df.columns: df["代码"] = df["代码"].map(normalize_code)
             return stamp, df
-        except Exception as exc:
-            log(f"读取上次运行快照失败：{exc}")
+        except Exception: pass
 
     daily = []
     for filename in os.listdir(REPORT_DIR):
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", filename):
             date_text = filename[:-4]
-            if date_text < today:
-                daily.append((date_text, os.path.join(REPORT_DIR, filename)))
-
-    if not daily:
-        return None, pd.DataFrame()
+            if date_text < today: daily.append((date_text, os.path.join(REPORT_DIR, filename)))
+    if not daily: return None, pd.DataFrame()
 
     prev_date, path = sorted(daily, reverse=True)[0]
     try:
         df = pd.read_csv(path, dtype={"代码": str})
-        if not df.empty and "代码" in df.columns:
-            df["代码"] = df["代码"].map(normalize_code)
+        if not df.empty and "代码" in df.columns: df["代码"] = df["代码"].map(normalize_code)
         return prev_date, df
-    except Exception as exc:
+    except Exception:
         return prev_date, pd.DataFrame()
 
 
@@ -380,10 +297,8 @@ def learning_paths():
 def read_json(path, default):
     try:
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+            with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: pass
     return default
 
 
@@ -407,21 +322,16 @@ def diagnose_drop(old, current_price, current_pct, market_pct=None):
         if np.isfinite(old_macd) and old_macd < 0: reasons.append("入选时MACD仍在零轴下方")
         if np.isfinite(old_pct) and old_pct >= 5: reasons.append("入选当日涨幅较大")
         if not reasons: reasons.append("已确认价格走弱，需进一步核对公告")
-    elif np.isfinite(change) and change < 0:
-        reasons.append("小幅回撤")
-    elif np.isfinite(change):
-        reasons.append("未出现下跌型失误")
-    else:
-        reasons.append("价格数据不完整")
+    elif np.isfinite(change) and change < 0: reasons.append("小幅回撤")
+    elif np.isfinite(change): reasons.append("未出现下跌型失误")
+    else: reasons.append("价格数据不完整")
     return change, "；".join(reasons)
 
 
 def update_learning(previous_date, previous_df, current_spot, today):
     paths = learning_paths()
     outcomes_path = paths["outcomes"]
-
-    if previous_df is None or previous_df.empty:
-        return pd.DataFrame(), ["没有上一交易日推荐记录"]
+    if previous_df is None or previous_df.empty: return pd.DataFrame(), ["没有上一交易日推荐记录"]
 
     snap = current_spot.copy()
     snap["纯代码"] = snap["代码"].map(normalize_code)
@@ -485,8 +395,8 @@ def update_learning(previous_date, previous_df, current_spot, today):
     summary = f"截至{today}累计{len(new_df)}条T+1样本；明显下跌样本{len(drops)}条。"
     memory.setdefault("经验摘要", []).append(summary)
     memory["经验摘要"] = memory["经验摘要"][-30:]
-
     with open(paths["memory"], "w", encoding="utf-8") as f: json.dump(memory, f, ensure_ascii=False, indent=2)
+
     return new_df, [f"已更新学习样本：本轮新增{len(outcome_rows)}条，累计{len(new_df)}条。"]
 
 
@@ -522,11 +432,9 @@ def apply_learned_penalties(candidates):
 
 def fetch_hist(code, today_compact):
     try:
-        # 增加请求延时
-        time.sleep(random.uniform(0.1, 0.5))
+        time.sleep(random.uniform(0.1, 0.4))
         hist = data_source.get_history(code, CONFIG)
-        if hist is not None and len(hist) >= 60:
-            return hist
+        if hist is not None and len(hist) >= 60: return hist
         raise RuntimeError("历史行情为空或不足60条")
     except Exception as exc:
         raise RuntimeError(f"历史行情获取失败：{exc}")
@@ -536,21 +444,17 @@ def process_single_stock(row, today_compact, board_map=None):
     raw_code = str(row.get("代码", ""))
     code = normalize_code(raw_code)
     name = str(row.get("名称", ""))
-
     if not code or "ST" in name.upper() or "退" in name: return None
 
     try:
         hist_raw = fetch_hist(code, today_compact)
         hist = calculate_indicators(hist_raw)
-
-        if hist is None or len(hist) < 60:
-            raise RuntimeError("日线历史不足60根")
+        if hist is None or len(hist) < 60: raise RuntimeError("日线历史不足60根")
 
         last = hist.iloc[-1]
         prev = hist.iloc[-2]
         price = safe_float(row.get("最新价"))
         pct = safe_float(row.get("涨跌幅"))
-
         if not np.isfinite(price) or price <= 0 or not np.isfinite(pct): return None
 
         ma5 = safe_float(last.get("MA5"))
@@ -566,7 +470,6 @@ def process_single_stock(row, today_compact, board_map=None):
         prev_hist = hist.iloc[:-1].tail(60)
         high_col = get_col(prev_hist, ["_high"])
         low_col = get_col(prev_hist, ["_low"])
-
         high20 = safe_float(prev_hist.tail(20)[high_col].max()) if high_col else np.nan
         low20 = safe_float(prev_hist.tail(20)[low_col].min()) if low_col else np.nan
         high60 = safe_float(prev_hist[high_col].max()) if high_col else np.nan
@@ -574,14 +477,15 @@ def process_single_stock(row, today_compact, board_map=None):
 
         support = max([x for x in [low20, ma20, ma60] if np.isfinite(x) and x < price], default=np.nan)
         resistance = min([x for x in [high20, high60] if np.isfinite(x) and x > price], default=np.nan)
-
         support_dist = ((price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan)
         resistance_dist = ((resistance / price - 1) * 100 if (np.isfinite(resistance) and price > 0) else np.nan)
 
+        # 如果拿不到15分钟数据，这里会返回 None，不会抛出异常导致整个股票跳过
         intraday = fetch_intraday_15m(code)
         m15_macd, m15_prev, m15_dif, m15_dea, m15_rsi = np.nan, np.nan, np.nan, np.nan, np.nan
         m15_volume_trend = "分钟数据不可用"
 
+        # 只有拿到了 15 分钟数据才计算 15 分钟指标
         if intraday is not None and len(intraday) >= 3:
             ilast = intraday.iloc[-1]
             iprev = intraday.iloc[-2]
@@ -590,82 +494,62 @@ def process_single_stock(row, today_compact, board_map=None):
             m15_dif = safe_float(ilast.get("DIF"))
             m15_dea = safe_float(ilast.get("DEA"))
             m15_rsi = safe_float(ilast.get("RSI15"))
-
             v = pd.to_numeric(intraday["成交量"].tail(6), errors="coerce")
-            if len(v) >= 6 and v.iloc[-3:].mean() > v.iloc[:3].mean():
-                m15_volume_trend = "尾盘量能增强"
-            elif len(v) >= 6:
-                m15_volume_trend = "尾盘量能平稳/减弱"
+            if len(v) >= 6 and v.iloc[-3:].mean() > v.iloc[:3].mean(): m15_volume_trend = "尾盘量能增强"
+            elif len(v) >= 6: m15_volume_trend = "尾盘量能平稳/减弱"
 
         score = 0.0
         reasons, risks = [], []
 
+        # ===== 15分钟指标评分（如果不可用会跳过，不影响下面日线指标评分） =====
         if np.isfinite(m15_macd) and np.isfinite(m15_prev):
-            if m15_macd > m15_prev:
-                score += 1.1; reasons.append("15分钟MACD改善")
+            if m15_macd > m15_prev: score += 1.1; reasons.append("15分钟MACD改善")
             else: risks.append("15分钟MACD走弱")
-
-            if np.isfinite(m15_dif) and np.isfinite(m15_dea) and m15_dif > m15_dea:
-                score += 0.7; reasons.append("15分钟MACD处于多头")
+            if np.isfinite(m15_dif) and np.isfinite(m15_dea) and m15_dif > m15_dea: score += 0.7; reasons.append("15分钟MACD处于多头")
             else: risks.append("15分钟MACD未形成多头")
         else: risks.append("缺少15分钟数据，尾盘信号不完整")
 
         if np.isfinite(m15_rsi):
-            if 48 <= m15_rsi <= 68:
-                score += 0.8; reasons.append("15分钟RSI强度适中")
-            elif 42 <= m15_rsi < 48:
-                score += 0.35
-            elif m15_rsi >= 78:
-                risks.append("15分钟RSI过热")
+            if 48 <= m15_rsi <= 68: score += 0.8; reasons.append("15分钟RSI强度适中")
+            elif 42 <= m15_rsi < 48: score += 0.35
+            elif m15_rsi >= 78: risks.append("15分钟RSI过热")
         else: risks.append("15分钟RSI不可用")
 
-        if price >= ma5 and price >= ma10:
-            score += 0.8; reasons.append("价格站在MA5/MA10上方")
-        elif price >= ma20:
-            score += 0.35
+        # ===== 日线指标评分（无论 15 分钟拉没拉到，都会继续执行） =====
+        if price >= ma5 and price >= ma10: score += 0.8; reasons.append("价格站在MA5/MA10上方")
+        elif price >= ma20: score += 0.35
         else: risks.append("价格低于MA20")
 
-        if np.isfinite(ma20) and np.isfinite(ma60) and ma20 >= ma60:
-            score += 0.6; reasons.append("MA20在MA60上方")
+        if np.isfinite(ma20) and np.isfinite(ma60) and ma20 >= ma60: score += 0.6; reasons.append("MA20在MA60上方")
         else: risks.append("日线中期趋势偏弱")
 
-        if np.isfinite(daily_macd) and daily_macd > 0:
-            score += 0.45; reasons.append("日线MACD在零轴上方")
-        elif np.isfinite(daily_macd) and daily_macd > safe_float(prev.get("MACD"), -999):
-            score += 0.25; reasons.append("日线MACD边际改善")
+        if np.isfinite(daily_macd) and daily_macd > 0: score += 0.45; reasons.append("日线MACD在零轴上方")
+        elif np.isfinite(daily_macd) and daily_macd > safe_float(prev.get("MACD"), -999): score += 0.25; reasons.append("日线MACD边际改善")
 
         if np.isfinite(daily_rsi) and 45 <= daily_rsi <= 70: score += 0.35
         elif np.isfinite(daily_rsi) and daily_rsi > 78: risks.append("日线RSI过热")
 
-        if 0.8 <= volume_ratio <= 2.5:
-            score += 0.55; reasons.append("日内量比适中")
-        elif volume_ratio > 4:
-            risks.append("量比过高，警惕尾盘分歧")
+        if 0.8 <= volume_ratio <= 2.5: score += 0.55; reasons.append("日内量比适中")
+        elif volume_ratio > 4: risks.append("量比过高，警惕尾盘分歧")
 
-        if 0 <= pct <= 3.5:
-            score += 0.45; reasons.append("当日涨幅不过度")
-        elif pct > 6:
-            risks.append("当日涨幅过大，隔夜追高风险")
+        if 0 <= pct <= 3.5: score += 0.45; reasons.append("当日涨幅不过度")
+        elif pct > 6: risks.append("当日涨幅过大，隔夜追高风险")
 
         if np.isfinite(turnover) and 1.5 <= turnover <= 12: score += 0.3
         elif np.isfinite(turnover) and turnover > 20: risks.append("换手率异常偏高")
 
         if np.isfinite(support_dist):
-            if 0 <= support_dist <= 3.0:
-                score += 0.65; reasons.append("靠近20/60日支撑区")
+            if 0 <= support_dist <= 3.0: score += 0.65; reasons.append("靠近20/60日支撑区")
             elif support_dist > 8: risks.append("距离下方支撑较远")
 
         if np.isfinite(resistance_dist):
             if resistance_dist <= 1.2: risks.append("临近20/60日压力位，突破空间有限")
-            elif resistance_dist >= 2.5:
-                score += 0.45; reasons.append("上方短期压力空间尚可")
+            elif resistance_dist >= 2.5: score += 0.45; reasons.append("上方短期压力空间尚可")
 
-        if np.isfinite(support_dist) and support_dist <= 2.0 and m15_volume_trend == "尾盘量能增强":
-            score += 0.35; reasons.append("支撑附近出现量能增强")
-
+        if np.isfinite(support_dist) and support_dist <= 2.0 and m15_volume_trend == "尾盘量能增强": score += 0.35; reasons.append("支撑附近出现量能增强")
         if m15_volume_trend == "尾盘量能增强": score += 0.25
 
-        limit_pct = (20.0 if code.startswith(("300", "301", "688", "689")) else 10.0)
+        limit_pct = (20.0 if code.startswith(("300", "301")) else 10.0)
         if pct <= -10.0 or pct >= limit_pct - 0.15 or price > 800: return None
 
         for risk, penalty in [
@@ -721,7 +605,7 @@ def build_fallback_candidates(spot, existing, top_n=3):
         if not np.isfinite(price) or price <= 0 or price > 800 or not np.isfinite(pct): continue
         if pct <= -10: continue
         
-        limit_pct = (20.0 if code.startswith(("300", "301", "688", "689")) else 10.0)
+        limit_pct = (20.0 if code.startswith(("300", "301")) else 10.0)
         if pct >= limit_pct - 0.15: continue
 
         volume_ratio = safe_float(row.get("量比"), 0.0)
@@ -880,11 +764,9 @@ def scan_market():
     code = spot["纯代码"].astype(str)
     name = spot["名称"].astype(str)
 
-    # 去除了 688 和 689，排除科创板
     is_sz_sh = code.str.match(r"^(000|001|002|003|300|301|600|601|603|605)")
     limit_pct = np.where(code.str.startswith(("300", "301")), 20.0, 10.0)
 
-    # 过滤：非ST、非退市、非停牌、涨幅不超限、跌幅不过大
     spot = spot[
         is_sz_sh
         & (~name.str.contains(r"ST|退", case=False, na=False))
@@ -894,12 +776,12 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
-    # 取消 500 只限制，按成交额排序，全市场扫描
     spot["_amount_sort"] = spot["成交额"].fillna(0)
-    max_candidates = int(CONFIG.get("screening", {}).get("shortlist_size", 5000))
+    # 不再强制写死 800，根据配置读取，如果配置没读出来默认 9999 全市场
+    max_candidates = int(CONFIG.get("screening", {}).get("shortlist_size", 9999))
     spot = spot.sort_values("_amount_sort", ascending=False).head(max_candidates).drop(columns=["_amount_sort"])
 
-    log(f"基础过滤后进入深度分析：{len(spot)} 只（无成交额准入门槛）")
+    log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场扫描）")
 
     market_stats = market_temperature(spot_all)
     sector_df, sector_status = build_sector_heat(spot_all)
@@ -934,7 +816,7 @@ def scan_market():
                 row = futures[future]
                 errors.append({"时间": sh_now().strftime("%Y-%m-%d %H:%M:%S"), "错误": f"{row.get('代码')} {row.get('名称')}: {exc}"})
 
-            if completed % 50 == 0 or completed == total:
+            if completed % 100 == 0 or completed == total:
                 log(f"进度：{completed}/{total}；有效候选 {len(candidates)}；失败 {failed}")
 
     error_path = os.path.join(REPORT_DIR, "scan_errors.csv")
@@ -944,6 +826,7 @@ def scan_market():
     top_n = int(CONFIG.get("screening", {}).get("top_n", 3))
     if candidates: candidates = apply_learned_penalties(candidates)
 
+    # 把全市场抓日线失败的股票，降级扔进实时备选池
     fallback_candidates = build_fallback_candidates(spot, candidates, top_n=top_n)
     candidates.extend(fallback_candidates)
 
