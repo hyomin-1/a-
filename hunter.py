@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（纯新浪/腾讯 全市场防封版）
-策略：14:50尾盘观察买入，次日9:30—9:40退出评估
+A股猎手升级版（东财拉列表 + 腾讯全量K线 极速版）
 """
 import os
 import re
@@ -21,20 +20,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 并发 3，配合 3 秒超时，全市场大概 8-10 分钟跑完，绝不卡死
-MAX_WORKERS = 3
+# 【终极提速】并发拉到 15，超时 1.5 秒，绝不卡死
+MAX_WORKERS = 15
 TOP_N = 3
-
-
-def load_config():
-    try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        return {}
-
-
-CONFIG = load_config()
 
 
 def sh_now():
@@ -113,7 +101,7 @@ def calculate_indicators(df):
     return df
 
 
-# ================= 腾讯 / 新浪 数据接口 =================
+# ================= 纯腾讯/新浪 历史K线接口 =================
 
 def fetch_hist_tencent(code):
     market = "sh" if str(code).startswith(("6", "9")) else "sz"
@@ -121,8 +109,8 @@ def fetch_hist_tencent(code):
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{symbol},day,,,120,qfq"}
     try:
-        # 3秒极速超时断臂
-        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
+        # 1.5 秒极速超时断臂，拿不到直接切新浪
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=(1.5, 1.5))
         resp.raise_for_status()
         data = resp.json()
         node = data.get("data", {}).get(symbol, {})
@@ -148,7 +136,7 @@ def fetch_hist_sina(code):
     symbol = f"{market}{code}"
     url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=120"
     try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(2, 3))
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(1.5, 1.5))
         resp.raise_for_status()
         rows = resp.json()
         if not rows: return None
@@ -261,52 +249,34 @@ def process_single_stock(row):
 
 
 def get_full_market_snapshot():
-    log("使用新浪列表获取全市场股票代码...")
-    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    stocks = {}
-    
-    # 拉取所有新浪 A 股列表
-    for page in range(1, 61):
-        params = {"page": page, "num": 80, "sort": "symbol", "asc": 1, "node": "hs_a", "symbol": "", "_s_r_a": "page"}
-        try:
-            resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-            rows = resp.json()
-            if not rows: break
-            for r in rows:
-                code = r.get("code")
-                name = r.get("name")
-                if code and name:
-                    stocks[code] = name
-        except Exception:
-            break
+    log("使用东方财富列表接口获取全市场 5000+ 只代码（仅此一次请求，防封）...")
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": "6000", "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f2,f3,f6,f8,f10,f12,f14"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("diff")
+        if not items: raise RuntimeError("东财快照列表为空")
+        
+        rows = []
+        for it in items:
+            rows.append({
+                "代码": str(it.get("f12", "")), "名称": str(it.get("f14", "")),
+                "最新价": it.get("f2"), "涨跌幅": it.get("f3"),
+                "成交额": it.get("f6"), "换手率": it.get("f8"), "量比": it.get("f10")
+            })
+        spot = pd.DataFrame(rows)
+        for col in ["最新价", "涨跌幅", "成交额", "换手率", "量比"]:
+            spot[col] = pd.to_numeric(spot[col], errors="coerce")
             
-    codes = list(stocks.keys())
-    log(f"新浪全市场列表获取完成，共 {len(codes)} 只。开始拉取腾讯实时行情...")
-    
-    # 用腾讯批量查实时行情（每次 80 只）
-    quotes = []
-    batch_size = 80
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i+batch_size]
-        symbols = ",".join([f"sh{c}" if c.startswith("6") else f"sz{c}" for c in batch])
-        try:
-            resp = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-            resp.encoding = "gb18030"
-            lines = resp.text.split(";")
-            for line in lines:
-                if "=" not in line: continue
-                parts = line.split("~")
-                if len(parts) > 37:
-                    code = parts[2]
-                    quotes.append({
-                        "代码": code, "名称": parts[1], "最新价": safe_float(parts[3]),
-                        "涨跌幅": safe_float(parts[32]), "成交额": safe_float(parts[37]), 
-                        "换手率": safe_float(parts[38]) if len(parts) > 38 else np.nan, "量比": safe_float(parts[49]) if len(parts) > 49 else np.nan
-                    })
-        except Exception:
-            pass
-            
-    return pd.DataFrame(quotes)
+        return spot
+    except Exception as exc:
+        raise RuntimeError(f"全市场列表获取失败: {exc}")
 
 
 def scan_market():
@@ -316,7 +286,6 @@ def scan_market():
 
     log("获取全市场实时快照...")
     spot = get_full_market_snapshot()
-    if spot.empty: raise RuntimeError("获取全市场快照失败")
 
     spot["纯代码"] = spot["代码"].astype(str)
     code = spot["纯代码"]
