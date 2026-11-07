@@ -13,11 +13,11 @@
     "primary": "sina",
     "history": "tencent",
     "intraday": "tencent_15m",
-    "max_workers": 2,
+    "max_workers": 8,
     "request_timeout_seconds": 10
   },
   "screening": {
-    "shortlist_size": 1200,
+    "shortlist_size": 9999,
     "top_n": 3,
     "buy_top_n": 2,
     "min_price": 0,
