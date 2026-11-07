@@ -28,7 +28,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "8"))
+MAX_WORKERS = int(os.getenv("A_SHARE_WORKERS", "4")) # 建议调低并发，避免被新浪/腾讯限流
 TOP_N = 3
 MIN_SCORE = 0.0
 HISTORY_DAYS = 120
@@ -168,115 +168,107 @@ def calculate_indicators(df):
     return df
 
 
-def fetch_intraday_15m(code):
-    """
-    腾讯15分钟K线。
-    失败时返回None，不拿日线冒充分钟指标。
-    """
-    market = (
-        "sh"
-        if str(code).startswith(("6", "9"))
-        else "sz"
-    )
-
+def fetch_tencent_15m(code):
+    """腾讯15分钟K线"""
+    market = "sh" if str(code).startswith(("6", "9")) else "sz"
     symbol = f"{market}{code}"
-
-    url = (
-        "https://proxy.finance.qq.com/"
-        "ifzqgtimg/appstock/app/newfqkline/get"
-    )
-
-    params = {
-        "param": f"{symbol},m15,,,160,qfq"
-    }
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://finance.qq.com/"
-    }
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+    params = {"param": f"{symbol},m15,,,160,qfq"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.qq.com/"}
 
     try:
-        resp = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=12
-        )
-
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
-
-        node = payload.get(
-            "data", {}
-        ).get(symbol, {})
-
-        rows = (
-            node.get("m15")
-            or node.get("qfq_m15")
-            or []
-        )
+        node = payload.get("data", {}).get(symbol, {})
+        rows = node.get("m15") or node.get("qfq_m15") or []
 
         if not rows:
-            log(f"{code} 腾讯15分钟接口未返回K线")
             return None
 
-        # 腾讯分钟K线：
-        # [时间,开盘,收盘,最高,最低,成交量]
-        df = pd.DataFrame(rows)
-
-        if df.shape[1] < 6:
-            log(f"{code} 腾讯15分钟K线字段不足")
-            return None
-
-        df = df.iloc[:, :6]
-        df.columns = [
-            "时间", "开盘", "收盘",
-            "最高", "最低", "成交量"
-        ]
-
-        for col in [
-            "开盘", "收盘", "最高",
-            "最低", "成交量"
-        ]:
-            df[col] = pd.to_numeric(
-                df[col], errors="coerce"
-            )
-
-        df = df.dropna(
-            subset=["收盘"]
-        ).reset_index(drop=True)
-
-        if len(df) < 30:
-            log(
-                f"{code} 腾讯15分钟K线不足30根，"
-                f"实际{len(df)}根"
-            )
-            return None
-
-        close = df["收盘"]
-
-        dif = (
-            close.ewm(span=12, adjust=False).mean()
-            - close.ewm(span=26, adjust=False).mean()
-        )
-
-        dea = dif.ewm(
-            span=9, adjust=False
-        ).mean()
-
-        df["DIF"] = dif
-        df["DEA"] = dea
-        df["MACD"] = 2 * (dif - dea)
-        df["RSI15"] = calculate_rsi(close, 14)
-
-        return df
-
-    except Exception as exc:
-        log(
-            f"{code} 腾讯15分钟数据不可用："
-            f"{type(exc).__name__}: {exc}"
-        )
+        df = pd.DataFrame(rows).iloc[:, :6]
+        df.columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
+        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["收盘"]).reset_index(drop=True)
+    except Exception:
         return None
+
+
+def fetch_sina_15m(code):
+    """新浪15分钟K线（作为腾讯的备用源）"""
+    market = "sh" if str(code).startswith(("6", "9")) else "sz"
+    symbol = f"{market}{code}"
+    url = f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_{symbol}_15m=/CN_MarketDataService.getKLineData"
+    params = {"symbol": symbol, "scale": "15", "ma": "no", "datalen": "160"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
+        
+        # 解析新浪返回的 JSONP 格式
+        match = re.search(r"=\s*\((\[.*\])\);", text, re.S)
+        if not match:
+            return None
+            
+        rows = json.loads(match.group(1))
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+        # 新浪字段：day, open, high, low, close, volume
+        df = df.rename(columns={
+            "day": "时间",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量"
+        })
+        
+        for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+        return df.dropna(subset=["收盘"]).reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def fetch_intraday_15m(code):
+    """
+    获取15分钟K线。
+    优先请求腾讯，失败或返回空时，自动降级请求新浪。
+    全部失败时返回None，不拿日线冒充分钟指标。
+    """
+    # 1. 尝试腾讯接口
+    df = fetch_tencent_15m(code)
+    if df is not None and len(df) >= 30:
+        source = "腾讯"
+    else:
+        # 2. 腾讯失败，降级尝试新浪接口
+        df = fetch_sina_15m(code)
+        source = "新浪"
+
+    if df is None or len(df) < 30:
+        log(f"{code} 腾讯/新浪15分钟接口均未返回足够K线")
+        return None
+
+    # 统一计算 MACD 和 RSI
+    close = df["收盘"]
+    dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    
+    df["DIF"] = dif
+    df["DEA"] = dea
+    df["MACD"] = 2 * (dif - dea)
+    df["RSI15"] = calculate_rsi(close, 14)
+    
+    # 可选：打印一次日志，方便查看数据到底来自哪个源
+    # log(f"{code} 15分钟数据获取成功，来源：{source}")
+    
+    return df
 
 
 def market_temperature(snapshot):
@@ -1074,7 +1066,7 @@ def process_single_stock(
             else np.nan
         )
 
-        # 15分钟MACD/RSI用于尾盘节奏。
+        # 15分钟MACD/RSI用于尾盘节奏。包含自动降级逻辑。
         intraday = fetch_intraday_15m(code)
 
         m15_macd = np.nan
