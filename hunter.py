@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A股猎手：14:50尾盘隔夜超短线扫描与T+1复盘。"""
+"""A股猎手 V4：双路线100分制尾盘隔夜扫描与复盘。"""
 import os
 import json
 import time
@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-import requests
 
 from data_source import (
     get_market_snapshot, get_history,
@@ -56,6 +55,12 @@ def macd(series):
     return dif, dea, hist
 
 
+def calc_atr(hist, period=14):
+    high, low, close = hist["high"], hist["low"], hist["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
 def limit_rate(code, name):
     name = str(name).upper()
     if "ST" in name:
@@ -65,31 +70,14 @@ def limit_rate(code, name):
     return 10.0
 
 
-def support_resistance(hist, price):
-    """用近10/20/60日高低点及MA20/MA60估算支撑压力。"""
-    low_col = hist["low"]
-    high_col = hist["high"]
-    ma20 = fnum(hist["close"].rolling(20).mean().iloc[-1])
-    ma60 = fnum(hist["close"].rolling(60).mean().iloc[-1])
-
-    lows = [
-        fnum(low_col.tail(10).min()),
-        fnum(low_col.tail(20).min()),
-        fnum(low_col.tail(60).min()),
-        ma20, ma60
-    ]
-    highs = [
-        fnum(high_col.tail(10).max()),
-        fnum(high_col.tail(20).max()),
-        fnum(high_col.tail(60).max())
-    ]
-
-    supports = sorted([x for x in lows if np.isfinite(x) and 0 < x <= price])
-    resistances = sorted([x for x in highs if np.isfinite(x) and x >= price])
-
-    support = supports[-1] if supports else np.nan
-    resistance = resistances[0] if resistances else np.nan
-    return support, resistance, ma20, ma60
+def get_price_position(hist, period):
+    """计算价格分位：(当前价 - 区间最低) / (区间最高 - 区间最低) * 100"""
+    recent = hist.tail(period)
+    h_max, l_min = recent["high"].max(), recent["low"].min()
+    price = hist["close"].iloc[-1]
+    if h_max == l_min:
+        return 50.0
+    return (price - l_min) / (h_max - l_min) * 100
 
 
 def analyze_one(stock, config):
@@ -97,147 +85,129 @@ def analyze_one(stock, config):
     name = str(stock["name"])
     price = fnum(stock.get("price"))
     pct = fnum(stock.get("change_pct"))
+    high = fnum(stock.get("high"))
+    low = fnum(stock.get("low"))
+    open_p = fnum(stock.get("open"))
+    
     if not np.isfinite(price) or price <= 0 or not np.isfinite(pct):
         return None
-
-    if price > float(config["screening"]["max_price"]):
-        return None
-    if pct <= -10:
+    if price > float(config["screening"]["max_price"]) or pct <= -10:
         return None
     limit = limit_rate(code, name)
     if pct >= limit - 0.2:
         return None
 
     hist = get_history(code, config)
-    close = hist["close"]
     if len(hist) < 60:
         return None
 
+    close = hist["close"]
     ma5 = close.rolling(5).mean()
     ma10 = close.rolling(10).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
     dif, dea, mh = macd(close)
     day_rsi = rsi(close, 14)
+    atr = calc_atr(hist, 14)
+    
+    # 基础数据
+    cur_rsi = fnum(day_rsi.iloc[-1])
+    cur_atr = fnum(atr.iloc[-1])
+    pos20 = get_price_position(hist, 20)
+    pos60 = get_price_position(hist, 60)
+    vol5 = fnum(hist["volume"].tail(5).mean())
+    vol20 = fnum(hist["volume"].tail(20).mean())
+    vol_ratio_5_20 = vol5 / vol20 if vol20 > 0 else 1.0
+    
+    # 支撑压力
+    recent_low = fnum(hist["low"].tail(20).min())
+    recent_high = fnum(hist["high"].tail(20).max())
+    dist_support = (price / recent_low - 1) * 100 if recent_low > 0 else 99
+    dist_resistance = (recent_high / price - 1) * 100 if price > 0 else 0
+    
+    # 尾盘信号（当前快照的日内位置）
+    intraday_pos = (price - low) / (high - low) * 100 if high > low else 50
 
-    support, resistance, m20, m60 = support_resistance(hist, price)
-    deviation20 = (price / m20 - 1) * 100 if m20 > 0 else np.nan
+    # ================= 核心 100 分制评分 =================
+    score_a = 0 # 低位回调路线
+    score_b = 0 # 趋势启动路线
+    risk_deduction = 0 # 风险扣分
 
-    # 评分逻辑
-    score = 0.0
-    reasons, risks = [], []
+    # 1. 低位与回调质量 (满分25)
+    if pos20 <= 20: score_a += 5
+    elif pos20 <= 40: score_a += 3
+    if pos60 <= 30: score_a += 5
+    elif pos60 <= 50: score_a += 3
+    if 3 <= dist_resistance <= 15: score_a += 5 # 从近期高点回落适中
+    elif dist_resistance < 3: score_a += 2
+    if vol_ratio_5_20 < 1.0: score_a += 5 # 缩量回调
+    if 0 <= dist_support <= 3: score_a += 5 # 靠近支撑
 
-    if price > fnum(ma10.iloc[-1]) and fnum(ma10.iloc[-1]) >= fnum(ma10.iloc[-2]):
-        score += 1.0
-        reasons.append("价格站上MA10且MA10走平向上")
-    elif price > fnum(ma20.iloc[-1]):
-        score += 0.5
-        reasons.append("价格仍在MA20上方")
-    else:
-        risks.append("价格位于MA20下方")
+    # 2. 趋势启动信号 (满分20)
+    if price > ma5.iloc[-1] and ma5.iloc[-1] > ma5.iloc[-2]: score_b += 5
+    if dif.iloc[-1] > dea.iloc[-1] or (dif.iloc[-1] < dea.iloc[-1] and mh.iloc[-1] > mh.iloc[-2]): score_b += 5
+    if (hist["high"].tail(10).max() / hist["low"].tail(10).min() - 1) < 0.15: score_b += 5 # 横盘
+    if 1.1 <= vol_ratio_5_20 <= 2.5: score_b += 5 # 温和放量
 
-    if fnum(ma20.iloc[-1]) >= fnum(ma20.iloc[-3]):
-        score += 0.5
-        reasons.append("MA20趋势未明显走弱")
+    # 3. 资金与量价 (满分20，内外盘占5分，成交额活跃5分，量价配合10分)
+    amount_val = fnum(stock.get("amount"))
+    if amount_val and stock.get("source") == "tencent": amount_val *= 10000 # 腾讯万元转元
+    if amount_val and amount_val > 1e8: score_cash = 5
+    else: score_cash = 0
+    
+    outer, inner = fnum(stock.get("outer")), fnum(stock.get("inner"))
+    if np.isfinite(outer) and np.isfinite(inner) and outer > inner: score_cash += 5
+    elif np.isfinite(outer) and np.isfinite(inner) and outer <= inner: score_cash += 0
+    else: score_cash += 2.5 # 数据缺失给一半
+    
+    if pct > 0 and vol_ratio_5_20 > 1.0: score_cash += 10 # 放量上涨
+    elif pct <= 0 and vol_ratio_5_20 < 1.0: score_cash += 10 # 缩量下跌
+    else: score_cash += 3
 
-    if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]):
-        score += 0.7
-        reasons.append("日线MACD处于多头状态")
-    elif fnum(mh.iloc[-1]) > fnum(mh.iloc[-2]):
-        score += 0.4
-        reasons.append("日线MACD柱体改善")
-    else:
-        risks.append("日线MACD动能偏弱")
+    # 4. 技术趋势 (满分15)
+    score_trend = 0
+    if ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]: score_trend += 5
+    if dif.iloc[-1] > dea.iloc[-1]: score_trend += 5
+    if 40 <= cur_rsi <= 65: score_trend += 5
 
-    drsi = fnum(day_rsi.iloc[-1])
-    if 45 <= drsi <= 68:
-        score += 0.6
-        reasons.append("日线RSI处于适中区间")
-    elif drsi > 78:
-        risks.append("日线RSI过热")
+    # 5. 尾盘买入条件 (满分15)
+    score_tail = 0
+    if intraday_pos >= 70: score_tail += 5 # 收盘处于日内上部
+    if price >= open_p: score_tail += 5 # 收阳或平盘
+    if (high - price) / price < 0.01: score_tail += 5 # 临近收盘没有明显跳水
 
-    # 当日涨幅适中
-    if 0.2 <= pct <= 3.5:
-        score += 0.7
-        reasons.append("当日涨幅适中")
-    elif -1.0 <= pct < 0.2 and price >= fnum(ma20.iloc[-1]):
-        score += 0.4
-        reasons.append("强势趋势内小幅整理")
-    elif pct > 5:
-        risks.append("当日涨幅偏大，隔夜追高风险")
+    # 6. 风险控制 (最高扣5分)
+    if pos60 > 85: risk_deduction += 2 # 高位
+    if cur_rsi > 80: risk_deduction += 1 # 过热
+    if dist_resistance <= 1: risk_deduction += 1 # 压力近
+    if vol_ratio_5_20 > 4: risk_deduction += 1 # 异常放量
 
-    support_gap = (price / support - 1) * 100 if np.isfinite(support) and support > 0 else np.nan
-    resistance_gap = (resistance / price - 1) * 100 if np.isfinite(resistance) and price > 0 else np.nan
+    # 汇总路线
+    route_score = max(score_a, score_b)
+    route_name = "低位回调型" if score_a >= score_b else "趋势启动型"
+    
+    total_score = route_score + score_cash + score_trend + score_tail - risk_deduction
+    total_score = max(0, min(100, total_score))
 
-    if np.isfinite(support_gap) and 0 <= support_gap <= 3:
-        score += 0.8
-        reasons.append("价格靠近近端支撑区域")
-    elif np.isfinite(support_gap) and support_gap > 7:
-        risks.append("距离下方支撑较远")
-
-    if np.isfinite(resistance_gap) and resistance_gap <= 1.2:
-        score -= 0.6
-        risks.append("上方压力位较近，突破空间有限")
-    elif np.isfinite(resistance_gap) and resistance_gap >= 2.5:
-        score += 0.5
-        reasons.append("上方有一定空间")
-
-    # 量价
-    volume = fnum(hist["volume"].iloc[-1])
-    avg_volume = fnum(hist["volume"].tail(5).mean())
-    volume_ratio = volume / avg_volume if avg_volume > 0 else np.nan
-    if np.isfinite(volume_ratio) and 1.05 <= volume_ratio <= 2.5:
-        score += 0.5
-        reasons.append("近期成交量有温和活跃")
-    elif np.isfinite(volume_ratio) and volume_ratio > 4:
-        risks.append("成交量异常放大，注意分歧")
-
-    # 委比/内外盘
-    outer = fnum(stock.get("outer"))
-    inner = fnum(stock.get("inner"))
-    if np.isfinite(outer) and np.isfinite(inner) and outer + inner > 0:
-        if outer > inner:
-            score += 0.3
-            reasons.append("外盘成交暂时强于内盘")
-        else:
-            risks.append("内盘成交暂时偏强")
-
-    score = max(0, min(10, score))
-
-    tp05 = round(price * 1.005, 2)
-    tp1 = round(price * 1.01, 2)
-    tp2 = round(price * 1.02, 2)
-
-    stop_default = price * 0.992
-    stop_support = support * 0.997 if np.isfinite(support) and support > 0 else np.nan
-    stop = max(stop_default, stop_support) if np.isfinite(stop_support) else stop_default
-    stop = round(stop, 2)
-
-    if stop >= price:
-        stop = round(stop_default, 2)
+    # ATR 止损
+    atr_stop = price - 1.5 * cur_atr if np.isfinite(cur_atr) else price * 0.98
+    stop = max(atr_stop, recent_low * 0.995) # 不跌破支撑
+    if stop >= price: stop = price * 0.98
 
     return {
         "代码": code, "名称": name, "最新价": round(price, 2),
-        "当日涨幅%": round(pct, 2), "评分": round(score, 2),
-        "日线MACD": "多头" if fnum(dif.iloc[-1]) > fnum(dea.iloc[-1]) else "偏弱",
-        "日线RSI": round(drsi, 1) if np.isfinite(drsi) else None,
-        "MA10": round(fnum(ma10.iloc[-1]), 2),
-        "MA20": round(m20, 2) if np.isfinite(m20) else None,
-        "MA60": round(m60, 2) if np.isfinite(m60) else None,
-        "支撑位": round(support, 2) if np.isfinite(support) else None,
-        "压力位": round(resistance, 2) if np.isfinite(resistance) else None,
-        "距离支撑%": round(support_gap, 2) if np.isfinite(support_gap) else None,
-        "距离压力%": round(resistance_gap, 2) if np.isfinite(resistance_gap) else None,
-        "最低止盈价+0.5%": tp05,
-        "止盈价+1%": tp1,
-        "止盈价+2%": tp2,
-        "参考止损价": stop,
-        "量比代理": round(volume_ratio, 2) if np.isfinite(volume_ratio) else None,
-        "板块": "当前数据源未提供可靠行业映射",
-        "板块资金": "不可验证，不计入评分",
-        "评分理由": "；".join(reasons),
-        "风险提示": "；".join(risks) if risks else "未发现明显技术风险",
-        "数据完整性": "日线数据完整（关闭15分钟线防封IP）"
+        "当日涨幅%": round(pct, 2), "评分": round(total_score, 1),
+        "路线": route_name,
+        "形态分": f"{round(route_score,1)}/45",
+        "资金分": f"{round(score_cash,1)}/20",
+        "技术分": f"{round(score_trend,1)}/15",
+        "尾盘分": f"{round(score_tail,1)}/15",
+        "扣分": f"-{risk_deduction}",
+        "日线RSI": round(cur_rsi, 1), "价格分位20日": round(pos20, 1), "价格分位60日": round(pos60, 1),
+        "支撑位": round(recent_low, 2), "压力位": round(recent_high, 2),
+        "参考止损价": round(stop, 2),
+        "止盈价+1%": round(price * 1.01, 2),
+        "止盈价+2%": round(price * 1.02, 2),
     }
 
 
@@ -247,25 +217,25 @@ def market_stats(snapshot):
     up = int((pct > 0).sum())
     down = int((pct < 0).sum())
     flat = int((pct == 0).sum())
-    up_limit = int((pct >= 9.5).sum())
-    down_limit = int((pct <= -9.5).sum())
     breadth = up / max(1, len(pct.dropna()))
-    amount = pd.to_numeric(df["amount"], errors="coerce").sum(min_count=1)
+    
+    # 修正成交额单位
+    amounts = []
+    for s in snapshot:
+        a = fnum(s.get("amount"), 0)
+        if s.get("source") == "tencent": a *= 10000
+        amounts.append(a)
+    amount = sum(amounts)
 
-    if breadth >= .65 and down_limit < 15:
-        mood = "偏热"
-    elif breadth >= .52 and down_limit < 25:
-        mood = "温和偏强"
-    elif breadth <= .35 or down_limit >= 30:
-        mood = "偏冷"
-    else:
-        mood = "分化"
+    if breadth >= .65: mood = "偏热"
+    elif breadth >= .52: mood = "温和偏强"
+    elif breadth <= .35: mood = "偏冷"
+    else: mood = "分化"
 
     return {
         "总数": len(df), "上涨": up, "下跌": down, "平盘": flat,
-        "涨停附近": up_limit, "跌停附近": down_limit,
         "上涨比例%": round(breadth * 100, 1),
-        "成交额亿元": round(amount / 1e8, 1) if pd.notna(amount) else None,
+        "成交额亿元": round(amount / 1e8, 1) if amount else None,
         "市场热度": mood
     }
 
@@ -277,22 +247,17 @@ def load_previous():
         match = re.fullmatch(r"picks_(\d{4}-\d{2}-\d{2})\.csv", fn)
         if match and match.group(1) < today:
             files.append((match.group(1), fn))
-    if not files:
-        return None, pd.DataFrame()
-
+    if not files: return None, pd.DataFrame()
     previous_date, fn = sorted(files)[-1]
     try:
-        old = pd.read_csv(os.path.join(REPORT_DIR, fn), dtype={"代码": str})
-        return previous_date, old
-    except Exception as exc:
-        log(f"读取上一轮推荐失败：{exc}")
+        return previous_date, pd.read_csv(os.path.join(REPORT_DIR, fn), dtype={"代码": str})
+    except Exception:
         return None, pd.DataFrame()
 
 
 def review_previous(snapshot):
     date, old = load_previous()
-    if old.empty:
-        return date, pd.DataFrame()
+    if old.empty: return date, pd.DataFrame()
 
     current = {x["code"]: x for x in snapshot}
     rows = []
@@ -300,114 +265,71 @@ def review_previous(snapshot):
     for _, item in old.iterrows():
         code = str(item.get("代码", "")).zfill(6)
         cur = current.get(code)
-        if not cur:
-            continue
+        if not cur: continue
 
         old_price = fnum(item.get("最新价"))
         new_price = fnum(cur.get("price"))
         change = (new_price / old_price - 1) * 100 if old_price > 0 and new_price > 0 else np.nan
 
-        if not np.isfinite(change):
-            reason = "价格数据不完整"
-        elif change <= -2:
-            reason = "明显下跌：需检查市场环境、板块走弱、支撑失守及尾盘追高"
-        elif change < 0:
-            reason = "小幅回撤：观察支撑位和开盘承接"
-        else:
-            reason = "价格未下跌，记录正向样本"
+        if not np.isfinite(change): reason = "价格数据不完整"
+        elif change <= -2: reason = "明显下跌：需检查市场环境、支撑失守"
+        elif change < 0: reason = "小幅回撤：观察支撑位和开盘承接"
+        else: reason = "价格未下跌，记录正向样本"
 
         rows.append({
             "推荐日期": date, "代码": code, "名称": item.get("名称"),
             "前日参考价": old_price, "当前价": new_price,
             "T+1变化%": round(change, 2) if np.isfinite(change) else None,
-            "复盘结论": reason,
-            "前日评分": item.get("评分"),
-            "前日风险提示": item.get("风险提示")
+            "复盘结论": reason, "前日评分": item.get("评分"), "路线": item.get("路线", "未知")
         })
-
     return date, pd.DataFrame(rows)
 
 
 def save_learning(review):
-    if review.empty:
-        return
-
+    if review.empty: return
     path = os.path.join(REPORT_DIR, "overnight_learning.csv")
     if os.path.exists(path):
         try:
             old = pd.read_csv(path, dtype={"代码": str})
             review = pd.concat([old, review], ignore_index=True)
-        except Exception:
-            pass
-
+        except Exception: pass
     review = review.drop_duplicates(["推荐日期", "代码"], keep="last")
     review.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def write_report(day, stats, picks, candidates, review, source_status):
     lines = [
-        "# A股猎手｜隔夜超短报告",
-        f"**日期：{day}　运行时间：{now_cn():%H:%M}**",
-        "",
-        "## 01｜市场温度",
-        f"**{stats['市场热度']}**　上涨 {stats['上涨']} 家 / 下跌 {stats['下跌']} 家 / 平盘 {stats['平盘']} 家",
-        f"涨停附近 {stats['涨停附近']} 家　跌停附近 {stats['跌停附近']} 家　上涨比例 {stats['上涨比例%']}%",
-        f"两市成交额估算：{stats['成交额亿元']} 亿元",
-        "",
-        "## 02｜数据质量",
-        f"股票列表：{source_status.get('universe_count')} 只；实时行情：{source_status.get('snapshot_count')} 只",
-        f"腾讯行情：{source_status.get('tencent_count')} 只；新浪补充：{source_status.get('sina_count')} 只",
-        "行业资金净流入、概念资金流及政策新闻：当前数据接口未接入，报告不虚构相关结论。",
-        "",
-        "## 03｜隔夜综合排名前三",
-        "买入参考：14:50附近；次日卖出观察：9:30—9:40。止盈止损是参考价，不保证成交。"
+        f"# A股猎手 V4｜隔夜超短报告", f"**日期：{day}**", "",
+        "## 01｜市场温度", f"**{stats['市场热度']}**　上涨 {stats['上涨']} / 下跌 {stats['下跌']} / 平盘 {stats['平盘']}",
+        f"两市成交额估算：{stats['成交额亿元']} 亿元", "",
+        "## 02｜隔夜综合排名前三"
     ]
 
     if picks.empty:
-        lines.append("本轮没有取得有效技术分析结果。")
+        lines.append("本轮无有效候选。")
     else:
         for i, (_, x) in enumerate(picks.iterrows(), 1):
             lines += [
-                "",
-                f"### {i}. {x['名称']}（{x['代码']}）　**{x['评分']}/10分**",
-                f"- 参考买入价：**{x['最新价']}元**",
-                f"- 止盈：**{x['最低止盈价+0.5%']} / {x['止盈价+1%']} / {x['止盈价+2%']}元**",
-                f"- 参考止损：**{x['参考止损价']}元**",
-                f"- 支撑：{x['支撑位']}元　压力：{x['压力位']}元",
-                f"- 技术理由：{x['评分理由']}",
-                f"- 风险：{x['风险提示']}",
-                f"- 分时数据：{x['数据完整性']}；板块资金：{x['板块资金']}"
+                "", f"### {i}. {x['名称']}（{x['代码']}）　**{x['评分']}分** (路线: {x['路线']})",
+                f"- 形态分: {x['形态分']}　资金分: {x['资金分']}　技术分: {x['技术分']}　尾盘分: {x['尾盘分']}　风险扣分: {x['扣分']}",
+                f"- 现价：**{x['最新价']}元**　涨幅：{x['当日涨幅%']}%",
+                f"- 止盈：**{x['止盈价+1%']} / {x['止盈价+2%']}**　参考止损：**{x['参考止损价']}**",
+                f"- 支撑：{x['支撑位']}　压力：{x['压力位']}　20日/60日分位：{x['价格分位20日']}% / {x['价格分位60日']}%"
             ]
 
-    lines += ["", "## 04｜候选名单", f"本轮有效分析候选：{len(candidates)}只"]
-
+    lines += ["", "## 03｜候选名单 TOP 30"]
     if not candidates.empty:
-        lines.append("|排名|代码|名称|评分|涨幅|止盈+0.5%|止损|")
-        lines.append("|---:|---|---|---:|---:|---:|---:|")
+        lines.append("|排名|代码|名称|评分|路线|涨幅|止盈1%|止损|")
+        lines.append("|---:|---|---|---:|---|---:|---:|---:|")
         for i, (_, x) in enumerate(candidates.head(30).iterrows(), 1):
-            lines.append(
-                f"|{i}|{x['代码']}|{x['名称']}|{x['评分']}|{x['当日涨幅%']}%|"
-                f"{x['最低止盈价+0.5%']}|{x['参考止损价']}|"
-            )
+            lines.append(f"|{i}|{x['代码']}|{x['名称']}|{x['评分']}|{x['路线']}|{x['当日涨幅%']}%|{x['止盈价+1%']}|{x['参考止损价']}|")
 
-    lines += ["", "## 05｜上一轮复盘"]
-
+    lines += ["", "## 04｜上一轮复盘"]
     if review.empty:
         lines.append("暂无可复盘的上一轮推荐。")
     else:
         for _, x in review.iterrows():
-            lines.append(
-                f"- {x['名称']}（{x['代码']}）：T+1变化 {x['T+1变化%']}%；"
-                f"{x['复盘结论']}。原风险：{x.get('前日风险提示', '')}"
-            )
-
-    lines += [
-        "", "## 06｜交易纪律",
-        "- 0.5%/1%/2%为毛收益目标，需扣除佣金、印花税和滑点。",
-        "- 次日若高开冲高，可按计划分批兑现；若低开跌破支撑，不应机械等待止盈。",
-        "- A股T+1，买入当日不能卖出；跳空时止损价可能无法成交。",
-        "- 本报告是量化筛选参考，不保证盈利，也不构成投资承诺。"
-    ]
+            lines.append(f"- {x['名称']}：变化 {x['T+1变化%']}%；{x['复盘结论']}")
 
     with open(os.path.join(REPORT_DIR, "report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -418,7 +340,7 @@ def run():
     day = now_cn().strftime("%Y-%m-%d")
 
     reset_data_source_status()
-    log("获取全市场实时行情……")
+    log("获取行情快照……")
     snapshot = get_market_snapshot(CONFIG)
     stats = market_stats(snapshot)
 
@@ -427,96 +349,39 @@ def run():
         code, name = s["code"], s["name"]
         price = fnum(s.get("price"))
         pct = fnum(s.get("change_pct"))
-
-        if not np.isfinite(price) or not np.isfinite(pct):
-            continue
-        if price <= 0 or price > float(CONFIG["screening"]["max_price"]):
-            continue
-        if pct <= -10:
-            continue
-        if pct >= limit_rate(code, name) - 0.2:
-            continue
-
+        if not np.isfinite(price) or not np.isfinite(pct): continue
+        if price <= 0 or price > float(CONFIG["screening"]["max_price"]): continue
+        if pct <= -10 or pct >= limit_rate(code, name) - 0.2: continue
         screen.append(s)
 
-    log(f"硬性过滤后：{len(screen)}只，开始技术分析。")
-
+    log(f"过滤后：{len(screen)}只，开始 V4 深度评分。")
     workers = int(CONFIG.get("data_source", {}).get("max_workers", 8))
-    analyzed, errors = [], []
+    analyzed = []
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(analyze_one, s, CONFIG): s
-            for s in screen
-        }
-
+        futures = {pool.submit(analyze_one, s, CONFIG): s for s in screen}
         for i, future in enumerate(as_completed(futures), 1):
             try:
                 item = future.result()
-                if item:
-                    analyzed.append(item)
-            except Exception as exc:
-                errors.append({
-                    "代码": futures[future]["code"],
-                    "名称": futures[future]["name"],
-                    "错误": str(exc)[:300]
-                })
-
-            if i % 200 == 0 or i == len(futures):
-                log(f"进度 {i}/{len(futures)}，有效分析 {len(analyzed)}")
+                if item: analyzed.append(item)
+            except Exception:
+                pass
+            if i % 200 == 0: log(f"进度 {i}/{len(futures)}，有效 {len(analyzed)}")
 
     df = pd.DataFrame(analyzed)
-
     if not df.empty:
-        df = df.sort_values(
-            ["评分", "当日涨幅%"],
-            ascending=[False, False]
-        ).reset_index(drop=True)
+        df = df.sort_values(["评分", "当日涨幅%"], ascending=[False, False]).reset_index(drop=True)
+        df.to_csv(os.path.join(REPORT_DIR, f"candidates_{day}.csv"), index=False, encoding="utf-8-sig")
 
     picks = df.head(3).copy() if not df.empty else pd.DataFrame()
-
-    if not df.empty:
-        df.to_csv(
-            os.path.join(REPORT_DIR, f"candidates_{day}.csv"),
-            index=False, encoding="utf-8-sig"
-        )
-
     if not picks.empty:
-        picks.to_csv(
-            os.path.join(REPORT_DIR, f"picks_{day}.csv"),
-            index=False, encoding="utf-8-sig"
-        )
+        picks.to_csv(os.path.join(REPORT_DIR, f"picks_{day}.csv"), index=False, encoding="utf-8-sig")
 
     prev_date, review = review_previous(snapshot)
     save_learning(review)
+    write_report(day, stats, picks, df, review, get_data_source_status())
 
-    if errors:
-        pd.DataFrame(errors).to_csv(
-            os.path.join(REPORT_DIR, "scan_errors.csv"),
-            mode="a",
-            header=not os.path.exists(os.path.join(REPORT_DIR, "scan_errors.csv")),
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-    source_status = get_data_source_status()
-    write_report(day, stats, picks, df, review, source_status)
-
-    status = {
-        "date": day,
-        "market": stats,
-        "candidate_count": len(df),
-        "pick_count": len(picks),
-        "errors": len(errors),
-        "seconds": round(time.time() - start, 1),
-        "data_source": source_status
-    }
-
-    with open(os.path.join(REPORT_DIR, "status.json"), "w", encoding="utf-8") as f:
-        json.dump(status, f, ensure_ascii=False, indent=2)
-
-    log(f"完成：候选{len(df)}只，前三名{len(picks)}只，错误{len(errors)}条。")
-    log("报告位置：reports/report.md")
+    log(f"完成：候选{len(df)}只，前三名{len(picks)}只。")
 
 
 if __name__ == "__main__":
@@ -527,7 +392,3 @@ if __name__ == "__main__":
     except Exception as exc:
         log(f"扫描失败：{type(exc).__name__}: {exc}")
         traceback.print_exc()
-        with open(os.path.join(REPORT_DIR, "fatal_error.log"), "a", encoding="utf-8") as f:
-            f.write(f"\n{now_cn().isoformat()} {type(exc).__name__}: {exc}\n")
-            f.write(traceback.format_exc())
-        raise
