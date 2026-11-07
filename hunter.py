@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股猎手升级版（东财高并发极速防卡死版 - 终极版）
+A股猎手升级版（东方财富极速全量版）
 策略：14:50尾盘观察买入，次日9:30—9:40退出评估
 """
 import os
@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import data_source
 import numpy as np
 import pandas as pd
 
@@ -22,7 +21,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 TZ = ZoneInfo("Asia/Shanghai")
 REPORT_DIR = "reports"
-# 【终极提速】并发数拉满到 8，任何超时瞬间抛弃，绝不死等
+# 【核心修改】并发 8，配合断臂超时，绝不卡死
 MAX_WORKERS = 8
 TOP_N = 3
 MIN_SCORE = 0.0
@@ -121,11 +120,7 @@ def calculate_indicators(df):
 
 
 def fetch_hist(code, today_compact):
-    """
-    【绝对防卡死】东财为主，腾讯为辅。
-    超时设置为 (1.5, 1.5)，1.5秒拿不到直接抛弃，进入备选池。
-    """
-    # 1. 东方财富日线
+    """纯东方财富历史行情，1.5秒死锁超时"""
     secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
@@ -153,15 +148,7 @@ def fetch_hist(code, today_compact):
             if len(df) >= 60: return df
     except Exception:
         pass
-
-    # 2. 腾讯备用 (同样限制1.5秒超时)
-    try:
-        hist = data_source.get_history(code, CONFIG)
-        if hist is not None and len(hist) >= 60: return hist
-    except Exception:
-        pass
-
-    raise RuntimeError("历史行情获取失败(超时或空数据)")
+    raise RuntimeError("东财日线超时或为空")
 
 
 def market_temperature(snapshot):
@@ -348,7 +335,6 @@ def update_learning(previous_date, previous_df, current_spot, today):
     summary = f"截至{today}累计{len(new_df)}条T+1样本；明显下跌样本{len(drops)}条。"
     memory.setdefault("经验摘要", []).append(summary)
     memory["经验摘要"] = memory["经验摘要"][-30:]
-
     with open(paths["memory"], "w", encoding="utf-8") as f: json.dump(memory, f, ensure_ascii=False, indent=2)
     return new_df, [f"已更新学习样本：本轮新增{len(outcome_rows)}条，累计{len(new_df)}条。"]
 
@@ -387,7 +373,6 @@ def process_single_stock(row, today_compact, board_map=None):
     raw_code = str(row.get("代码", ""))
     code = normalize_code(raw_code)
     name = str(row.get("名称", ""))
-
     if not code or "ST" in name.upper() or "退" in name: return None
 
     try:
@@ -616,22 +601,37 @@ def build_fallback_candidates(spot, existing, top_n=3):
 
 
 def get_spot_snapshot():
-    log("使用新浪/腾讯接口获取全市场快照...")
-    data_source.reset_data_source_status()
-    snapshot = data_source.get_market_snapshot(CONFIG)
-    if not snapshot:
-        raise RuntimeError("实时快照接口返回空数据")
+    log("使用东方财富接口获取全市场快照...")
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": "6000", "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f2,f3,f6,f8,f10,f12,f14"
+    }
+    try:
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data", {}).get("diff")
+        if not items: raise RuntimeError("东财快照数据为空")
         
-    spot = pd.DataFrame(snapshot)
-    spot = spot.rename(columns={"code": "代码", "name": "名称", "price": "最新价", "change_pct": "涨跌幅", "amount": "成交额", "turnover_rate": "换手率"})
-    
-    for col in ["量比", "委比", "外盘", "内盘"]:
-        if col not in spot.columns: spot[col] = np.nan
-
-    for col in ["最新价", "涨跌幅", "成交额", "量比", "委比", "外盘", "内盘", "换手率"]:
-        if col in spot.columns: spot[col] = pd.to_numeric(spot[col], errors="coerce")
+        rows = []
+        for it in items:
+            rows.append({
+                "代码": str(it.get("f12", "")), "名称": str(it.get("f14", "")),
+                "最新价": it.get("f2"), "涨跌幅": it.get("f3"),
+                "成交额": it.get("f6"), "换手率": it.get("f8"), "量比": it.get("f10"),
+                "委比": np.nan, "外盘": np.nan, "内盘": np.nan
+            })
+        spot = pd.DataFrame(rows)
+        
+        for col in ["最新价", "涨跌幅", "成交额", "量比", "委比", "外盘", "内盘", "换手率"]:
+            spot[col] = pd.to_numeric(spot[col], errors="coerce")
             
-    return spot, "sina_tencent"
+        return spot, "eastmoney"
+    except Exception as exc:
+        raise RuntimeError(f"东财快照失败: {exc}")
 
 
 def review_previous_picks(previous_date, previous_df, current_spot):
@@ -747,6 +747,7 @@ def scan_market():
     code = spot["纯代码"].astype(str)
     name = spot["名称"].astype(str)
 
+    # 【剔除科创板及北交所，只保留沪深主板和创业板】
     is_sz_sh = code.str.match(r"^(000|001|002|003|300|301|600|601|603|605)")
     limit_pct = np.where(code.str.startswith(("300", "301")), 20.0, 10.0)
 
@@ -759,6 +760,7 @@ def scan_market():
         & (spot["涨跌幅"] < (limit_pct - 0.15))
     ].copy()
 
+    # 全市场扫描，不截断
     spot = spot.sort_values("成交额", ascending=False)
 
     log(f"基础过滤后进入深度分析：{len(spot)} 只（全市场深度扫描）")
@@ -767,7 +769,7 @@ def scan_market():
     sector_df, sector_status = build_sector_heat(spot_all)
     previous_date, previous_df = load_previous_picks(today)
     review_df, review_notes = review_previous_picks(previous_date, previous_df, spot_all)
-    learning_df, learning_notes = update_learning(previous_date, previous_df, spot_all, today)
+    update_learning(previous_date, previous_df, spot_all, today)
 
     candidates = []
     errors = []
